@@ -16,7 +16,13 @@ import numpy as np
 # Loaders, widgets and core utilities have moved into the iq_analyzer package.
 # Keep the old names available at module scope so the rest of this script keeps
 # working without change during the ongoing refactor.
-from iq_analyzer.core import StdoutRedirector, memory_status
+from iq_analyzer.core import (
+    StdoutRedirector,
+    auto_optimize_params,
+    compute_spectrogram,
+    memory_status,
+    min_max_downsample,
+)
 from iq_analyzer.loaders import IQTarLoader, WVFileLoader
 from iq_analyzer.widgets import SpectrogramWidget
 
@@ -1330,100 +1336,14 @@ class RSIQViewer(QMainWindow):
             self.region_curve.setData([], [])
 
     def _minmax_downsample(self, start_sample, end_sample, target_pixels):
-        """
-        Min-Maxダウンサンプリング
-
-        各ビン（区間）のMin/Max値を抽出することで、波形の包絡線を保持。
-        チャンク処理でメモリ効率を維持。
-
-        Args:
-            start_sample: 開始サンプル
-            end_sample: 終了サンプル
-            target_pixels: 目標ピクセル数
-
-        Returns:
-            (x_data, y_data): プロット用のXY配列
-        """
-        total_samples = end_sample - start_sample
-
-        # サンプル数が少ない場合はダウンサンプリング不要
-        # 3,200,000サンプル以下は実波形を表示（ユーザー要望）
-        if total_samples <= 3200000:
-            print(f"[実波形表示] サンプル数: {total_samples:,} <= 3,200,000 → 間引きなし")
-            # 全データをそのまま返す
-            iq_data = self.wv_loader.get_iq_data(start_sample, end_sample)
-            amplitudes = np.abs(iq_data)
-            # X座標を時間（秒）に変換
-            x_data = np.arange(start_sample, end_sample, dtype=np.float64) / self.sample_rate
-            y_data = amplitudes.astype(np.float32)
-            return x_data, y_data
-        else:
-            print(f"[Min-Max間引き] サンプル数: {total_samples:,} > 3,200,000 → target_pixels: {target_pixels}")
-
-        bin_size = max(1, total_samples // target_pixels)  # 最小値1を保証
-
-        # チャンクサイズ（100万サンプルずつ）
-        chunk_size = 1000000
-
-        x_mins = []
-        x_maxs = []
-        y_mins = []
-        y_maxs = []
-
-        # ビンごとに処理
-        for bin_idx in range(target_pixels):
-            bin_start = start_sample + bin_idx * bin_size
-            bin_end = min(start_sample + (bin_idx + 1) * bin_size, end_sample)
-
-            # このビン内のデータを読み込み（チャンク処理で）
-            if bin_end - bin_start > chunk_size:
-                # ビンが大きすぎる場合はさらにサンプリング
-                sample_indices = np.linspace(bin_start, bin_end - 1, min(chunk_size, bin_end - bin_start), dtype=np.int64)
-                iq_samples = []
-
-                # チャンクごとに読み込み
-                for i in range(0, len(sample_indices), chunk_size):
-                    chunk_idx_start = i
-                    chunk_idx_end = min(i + chunk_size, len(sample_indices))
-                    chunk_sample_idx = sample_indices[chunk_idx_start:chunk_idx_end]
-
-                    chunk_start_sample = int(chunk_sample_idx[0])
-                    chunk_end_sample = int(chunk_sample_idx[-1]) + 1
-
-                    chunk_data = self.wv_loader.get_iq_data(chunk_start_sample, chunk_end_sample)
-                    relative_idx = chunk_sample_idx - chunk_start_sample
-                    iq_samples.append(chunk_data[relative_idx])
-
-                iq_bin_data = np.concatenate(iq_samples)
-            else:
-                # ビンが小さい場合はそのまま読み込み
-                iq_bin_data = self.wv_loader.get_iq_data(bin_start, bin_end)
-
-            # 振幅計算
-            amplitudes = np.abs(iq_bin_data)
-
-            # Min/Max取得
-            min_val = np.min(amplitudes)
-            max_val = np.max(amplitudes)
-
-            # Min/Maxの位置（ビンの中央を代表値とする）- 時間（秒）に変換
-            bin_center = (bin_start + bin_end) / 2 / self.sample_rate
-
-            x_mins.append(bin_center)
-            x_maxs.append(bin_center)
-            y_mins.append(min_val)
-            y_maxs.append(max_val)
-
-        # Min/Maxを交互に配置（包絡線を描画）
-        x_data = np.empty(len(x_mins) * 2, dtype=np.float64)
-        y_data = np.empty(len(y_mins) * 2, dtype=np.float32)
-
-        x_data[0::2] = x_mins  # 偶数インデックス: Min
-        x_data[1::2] = x_maxs  # 奇数インデックス: Max
-        y_data[0::2] = y_mins
-        y_data[1::2] = y_maxs
-
-        return x_data, y_data
+        """Min-Max ダウンサンプリング（iq_analyzer.core.min_max_downsample へ委譲）。"""
+        return min_max_downsample(
+            self.wv_loader.get_iq_data,
+            start_sample,
+            end_sample,
+            target_pixels,
+            self.sample_rate,
+        )
 
     def show_fullspan_waveform(self):
         """
@@ -1786,82 +1706,9 @@ class RSIQViewer(QMainWindow):
             self.calculate_spectrogram()
 
     def auto_optimize_spectrogram_params(self, region_samples):
-        """
-        Region範囲のサンプル数に基づいて、スペクトログラムパラメータを自動最適化
-
-        信号を漏れなく抽出するため、以下の戦略を採用：
-        1. 短いパルス → 小さいNFFT（高時間分解能）+ 高オーバーラップ
-        2. 長い信号 → 大きいNFFT（高周波数分解能）+ 中程度オーバーラップ
-        3. 時間分解能とメモリ使用量のバランスを考慮
-
-        Args:
-            region_samples: Region範囲のサンプル数
-
-        Returns:
-            tuple: (最適NFFT, 最適オーバーラップ率%, ウィンドウ関数名, 推奨メッセージ)
-        """
-        # 時間長を計算（秒）
-        duration_sec = region_samples / self.sample_rate
-
-        # 時間長に応じた最適パラメータを決定
-        if duration_sec < 1e-6:  # 1 μs未満（極短パルス）
-            optimal_nfft = 64
-            optimal_overlap = 90
-            window = 'blackmanharris'  # サイドローブ抑圧重視
-            msg = "極短パルス検出: 最高時間分解能モード"
-        elif duration_sec < 10e-6:  # 10 μs未満（短パルス）
-            optimal_nfft = 128
-            optimal_overlap = 87.5
-            window = 'blackmanharris'
-            msg = "短パルス検出: 高時間分解能モード"
-        elif duration_sec < 100e-6:  # 100 μs未満
-            optimal_nfft = 256
-            optimal_overlap = 85
-            window = 'blackmanharris'
-            msg = "中短パルス検出: 高時間分解能モード"
-        elif duration_sec < 1e-3:  # 1 ms未満
-            optimal_nfft = 512
-            optimal_overlap = 80
-            window = 'hann'  # バランス型
-            msg = "中間長信号: バランスモード"
-        elif duration_sec < 10e-3:  # 10 ms未満
-            optimal_nfft = 1024
-            optimal_overlap = 75
-            window = 'hann'
-            msg = "中長信号: 標準モード"
-        elif duration_sec < 100e-3:  # 100 ms未満
-            optimal_nfft = 2048
-            optimal_overlap = 70
-            window = 'hann'
-            msg = "長信号: 高周波数分解能モード"
-        else:  # 100 ms以上
-            optimal_nfft = 4096
-            optimal_overlap = 65
-            window = 'hann'
-            msg = "超長信号: 最高周波数分解能モード"
-
-        # メモリ制約チェック（8GB RAM環境で処理可能な範囲に調整）
-        # ユーザー要望: 遅くなっても構わないので8GBマシンで処理できるようにする
-        max_memory_mb = 4000  # 最大4GB使用（8GB RAM環境を想定）
-        iq_data_mb = (region_samples * 8) / 1024 / 1024
-        time_frames = int(region_samples / (optimal_nfft * (1 - optimal_overlap/100)))
-        spectrogram_mb = (optimal_nfft * time_frames * 4) / 1024 / 1024
-        total_mb = iq_data_mb + spectrogram_mb
-
-        # メモリ超過の場合のみ、NFFTを増やしてフレーム数を削減
-        # 4GB以内であれば、時間がかかっても最適なパラメータを維持
-        if total_mb > max_memory_mb:
-            print(f"[メモリ最適化] 推定メモリ {total_mb:.0f} MB > 制限 {max_memory_mb} MB")
-            while total_mb > max_memory_mb and optimal_nfft < 16384:
-                optimal_nfft *= 2
-                optimal_overlap = max(50, optimal_overlap - 5)  # オーバーラップも削減
-                time_frames = int(region_samples / (optimal_nfft * (1 - optimal_overlap/100)))
-                spectrogram_mb = (optimal_nfft * time_frames * 4) / 1024 / 1024
-                total_mb = iq_data_mb + spectrogram_mb
-            msg += " (メモリ制約により調整)"
-            print(f"  調整後: NFFT={optimal_nfft}, メモリ={total_mb:.0f} MB")
-
-        return optimal_nfft, optimal_overlap, window, msg
+        """スペクトログラムパラメータ自動最適化（iq_analyzer.core.auto_optimize_params へ委譲）。"""
+        params = auto_optimize_params(region_samples, self.sample_rate)
+        return params.nfft, params.overlap_percent, params.window, params.message
 
     def calculate_spectrogram(self):
         """
@@ -1950,9 +1797,6 @@ class RSIQViewer(QMainWindow):
             print(f"  推定メモリ使用量: {total_estimated_mb:.1f} MB")
             print("=" * 60)
 
-            # パラメータ取得
-            noverlap = int(nfft * overlap_percent / 100)
-
             # IQデータ取得（保存した範囲を使用）
             print("IQデータを読み込み中...")
             iq_data = self.wv_loader.get_iq_data(
@@ -1961,66 +1805,18 @@ class RSIQViewer(QMainWindow):
             )
             print(f"データ読み込み完了: {len(iq_data):,} samples")
 
-            # スペクトログラム計算（最大値保持版）
-            print("スペクトログラムを計算中（最大値保持モード）...")
-            # fs: サンプリング周波数
-            # nperseg: セグメント長 = NFFT
-            # noverlap: オーバーラップサンプル数
-            # window: 最適化されたウィンドウ関数（信号漏れ防止）
+            # STFT を core ヘルパへ委譲
+            def _report(done, total):
+                print(f"  進捗: {done / total * 100:.1f}% ({done}/{total})")
 
-            # ウィンドウ関数を生成
-            if window == 'hann':
-                win = np.hanning(nfft)
-            elif window == 'blackmanharris':
-                win = np.blackman(nfft)
-            else:
-                win = np.hanning(nfft)  # デフォルト
-
-            # STFT実行（各時間フレームごとにFFT）
-            hop_length = nfft - noverlap
-            num_frames = 1 + (len(iq_data) - nfft) // hop_length
-
-            # 周波数ビンの定義
-            frequencies = np.fft.fftfreq(nfft, d=1/self.sample_rate)
-            frequencies = np.fft.fftshift(frequencies)  # [-fs/2, 0, fs/2]に並び替え
-
-            # 時間軸の定義
-            times = np.arange(num_frames) * hop_length / self.sample_rate
-
-            # スペクトログラム配列を初期化（周波数×時間）
-            sxx = np.zeros((nfft, num_frames), dtype=np.float32)
-
-            # 各時間フレームごとにFFTを実行し、パワースペクトルを計算
-            print(f"  フレーム数: {num_frames}, ホップ長: {hop_length}")
-            for i in range(num_frames):
-                start_idx = i * hop_length
-                end_idx = start_idx + nfft
-
-                # フレーム切り出し
-                frame = iq_data[start_idx:end_idx]
-
-                # ウィンドウ適用
-                windowed_frame = frame * win
-
-                # FFT実行
-                fft_result = np.fft.fft(windowed_frame)
-
-                # パワースペクトル（絶対値の2乗）
-                power_spectrum = np.abs(fft_result) ** 2
-
-                # 周波数軸を並び替え
-                power_spectrum = np.fft.fftshift(power_spectrum)
-
-                # スペクトログラムに格納
-                sxx[:, i] = power_spectrum
-
-                # 進捗表示（100フレームごと）
-                if (i + 1) % 100 == 0 or i == num_frames - 1:
-                    progress = (i + 1) / num_frames * 100
-                    print(f"  進捗: {progress:.1f}% ({i+1}/{num_frames})")
-
-            # パワーをdBに変換
-            sxx_db = 10 * np.log10(sxx + 1e-12)  # ゼロ除算防止
+            frequencies, times, sxx_db = compute_spectrogram(
+                iq_data,
+                nfft=nfft,
+                overlap_percent=overlap_percent,
+                window=window,
+                sample_rate=self.sample_rate,
+                progress=_report,
+            )
 
             print(f"計算完了")
             print(f"  スペクトログラム形状: {sxx_db.shape}")
