@@ -1,51 +1,79 @@
-"""Command-line entry point.
+"""Console entry point for the IQ analyzer.
 
-The actual viewer implementation currently lives in the legacy single-file
-script (``rs_iq_viewer.py`` at the project root). During the refactor this
-module simply delegates to it so that the packaged ``iq-analyzer`` command
-remains usable. Subsequent refactoring steps will gradually move the
-implementation into the :mod:`iq_analyzer` package.
+Exposed as the ``iq-analyzer`` script via ``[project.scripts]`` in
+``pyproject.toml`` and as ``python -m iq_analyzer`` via :mod:`__main__`.
 """
 
 from __future__ import annotations
 
-import runpy
+import gc
+import logging
 import sys
-from pathlib import Path
+
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QApplication
+
+logger = logging.getLogger(__name__)
+
+# Optional dark-theme dependency. The viewer works fine without it; we just
+# fall back to the platform default.
+try:
+    import qdarktheme  # type: ignore[import-not-found]
+
+    _HAS_DARKTHEME = True
+except ImportError:  # pragma: no cover - optional dep
+    qdarktheme = None  # type: ignore[assignment]
+    _HAS_DARKTHEME = False
 
 
-def _legacy_script_path() -> Path | None:
-    """Locate the legacy ``rs_iq_viewer.py`` next to the project root.
+def _platform_font_size() -> int:
+    """Smaller font on Windows so the dense UI fits 1080p, larger on macOS/Linux."""
+    return 9 if sys.platform == "win32" else 20
 
-    Returns ``None`` once the legacy script has been removed (post-migration).
+
+def main(argv: list[str] | None = None) -> int:
+    """Launch the GUI and run the Qt event loop.
+
+    Returns the application exit code. Wrapped by both the
+    ``iq-analyzer`` console script and ``python -m iq_analyzer``.
     """
-    # src/iq_analyzer/cli.py -> project root is two levels up from ``src``
-    candidates = [
-        Path(__file__).resolve().parents[2] / "rs_iq_viewer.py",
-        Path.cwd() / "rs_iq_viewer.py",
-    ]
-    for path in candidates:
-        if path.is_file():
-            return path
-    return None
+    if argv is None:
+        argv = sys.argv
+
+    app = QApplication.instance() or QApplication(argv)
+
+    font = QFont()
+    font.setPointSize(_platform_font_size())
+    app.setFont(font)
+
+    if _HAS_DARKTHEME:
+        try:
+            app.setStyleSheet(qdarktheme.load_stylesheet())
+        except Exception as exc:  # pragma: no cover - defensive
+            logger.warning("qdarktheme.load_stylesheet failed: %s", exc)
+
+    # Imported lazily so ``--help`` (etc., in the future) is cheap and so
+    # widget creation only happens after the QApplication exists.
+    from iq_analyzer.ui.main_window import RSIQViewer
+
+    viewer = RSIQViewer()
+    viewer.show()
+
+    print("=" * 60)
+    print("Rohde & Schwarz IQ Data Viewer")
+    print("Target: Windows 11, Core i3, 8GB RAM")
+    print("Supported formats: WVH/WVD, iq.tar")
+    print("=" * 60)
+    print("アプリケーションが起動しました。")
+    print("左側のファイルブラウザからファイルをダブルクリックしてください。")
+
+    exit_code = int(app.exec())
+
+    # closeEvent has already done the heavy cleanup; this is a final sweep so
+    # the (memmapped) loader buffers definitely release before the process exits.
+    gc.collect()
+    return exit_code
 
 
-def main() -> int:
-    """Launch the IQ viewer.
-
-    Returns a process exit code so that callers can propagate it.
-    """
-    script = _legacy_script_path()
-    if script is None:
-        sys.stderr.write(
-            "iq-analyzer: the legacy entry script rs_iq_viewer.py was not found, "
-            "and the package refactor has not yet wired up a native entry point.\n"
-        )
-        return 1
-
-    runpy.run_path(str(script), run_name="__main__")
-    return 0
-
-
-if __name__ == "__main__":
+if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(main())

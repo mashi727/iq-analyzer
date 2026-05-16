@@ -59,7 +59,13 @@ build-backend = "uv_build"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["rs_iq_viewer.py", "old", "data"]
+extend-exclude = [
+    "old",
+    "data",
+    # main_window.py is the as-moved legacy RSIQViewer body; future passes
+    # will split it further, at which point this exemption can go away.
+    "src/iq_analyzer/ui/main_window.py",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
