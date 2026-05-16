@@ -1,0 +1,6 @@
+"""iq-analyzer: High-performance IQ data viewer for Rohde & Schwarz IQW / iq.tar."""
+
+from __future__ import annotations
+
+__version__ = "0.1.0"
+__all__ = ["__version__"]

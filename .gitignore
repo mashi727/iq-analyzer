@@ -33,7 +33,18 @@ MANIFEST
 venv/
 env/
 ENV/
-.venv
+.venv/
+
+# uv
+uv.lock.bak
+
+# Coverage / pytest
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
 
 # IDE
 .vscode/

@@ -1,0 +1,73 @@
+[project]
+name = "iq-analyzer"
+version = "0.1.0"
+description = "High-performance IQ data viewer for Rohde & Schwarz IQW (WVH/WVD) and iq.tar measurement data."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "MASAMI Mashino", email = "mashi.zzz@gmail.com" }
+]
+keywords = ["iq-data", "spectrum-analyzer", "rohde-schwarz", "signal-processing", "pyside6"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: X11 Applications :: Qt",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Visualization",
+]
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "PySide6>=6.6",
+    "pyqtgraph>=0.13",
+    "numpy>=1.26",
+    "scipy>=1.11",
+    "psutil>=5.9",
+    "pyqtdarktheme>=2.1",
+]
+
+[project.optional-dependencies]
+build = [
+    "pyinstaller>=6.3",
+]
+
+[project.urls]
+Repository = "https://github.com/mashi727/iq-analyzer"
+Issues = "https://github.com/mashi727/iq-analyzer/issues"
+
+[project.scripts]
+iq-analyzer = "iq_analyzer.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.6",
+    "mypy>=1.10",
+]
+
+[build-system]
+requires = ["uv_build>=0.8.12,<0.9.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["rs_iq_viewer.py", "old", "data"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["E501"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["iq_analyzer"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
