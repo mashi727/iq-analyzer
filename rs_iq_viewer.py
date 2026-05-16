@@ -24,7 +24,12 @@ from iq_analyzer.core import (
     min_max_downsample,
 )
 from iq_analyzer.loaders import IQTarLoader, WVFileLoader
-from iq_analyzer.widgets import SpectrogramWidget
+from iq_analyzer.widgets import (
+    AdjustmentPanel,
+    ControlPanel,
+    FileBrowserPanel,
+    SpectrogramWidget,
+)
 
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -162,15 +167,38 @@ class RSIQViewer(QMainWindow):
         main_layout = QVBoxLayout(central)
 
         # === コントロールパネル ===
-        control_group = self.create_control_panel()
-        main_layout.addWidget(control_group)
+        self.control_panel = ControlPanel(
+            font_size_large=self.font_size_large,
+            button_height=self.button_height,
+            max_height=self.control_panel_height,
+        )
+        self.control_panel.calculate_clicked.connect(self.calculate_spectrogram)
+        self.control_panel.save_clicked.connect(self.save_region)
+        self.control_panel.exit_clicked.connect(self.safe_exit)
+        self.control_panel.breadcrumb_path_clicked.connect(self._on_breadcrumb_clicked)
+        # 旧 attribute alias（既存メソッドが直接参照しているため）
+        self.calc_spec_btn = self.control_panel.calc_spec_btn
+        self.save_btn = self.control_panel.save_btn
+        main_layout.addWidget(self.control_panel)
 
         # === メインエリア（水平分割：ファイルブラウザ | プロット表示） ===
         main_splitter = QSplitter(Qt.Horizontal)
 
         # === 左側：ファイルブラウザ ===
-        browser_widget = self.create_file_browser()
-        main_splitter.addWidget(browser_widget)
+        self.file_browser = FileBrowserPanel(
+            font_size_large=self.font_size_large,
+            font_size_small=self.font_size_small,
+        )
+        self.file_browser.current_dir_changed.connect(self.control_panel.set_breadcrumb_path)
+        self.file_browser.file_open_requested.connect(
+            lambda p: self.load_file(str(p))
+        )
+        self.file_browser.status_message.connect(
+            lambda msg: self.status_label.setText(msg)
+        )
+        # 初期パンくず
+        self.control_panel.set_breadcrumb_path(self.file_browser.current_root_dir)
+        main_splitter.addWidget(self.file_browser)
 
         # === 右側：プロット表示エリア（垂直分割） ===
         plot_container = QWidget()
@@ -302,8 +330,17 @@ class RSIQViewer(QMainWindow):
         bottom_layout.addWidget(stdout_group, 3)  # 幅の比率3
 
         # 右側: 調整パネル
-        adjust_group = self.create_adjustment_panel()
-        bottom_layout.addWidget(adjust_group, 1)  # 幅の比率1
+        self.adjust_panel = AdjustmentPanel()
+        self.adjust_panel.colormap_changed.connect(self.on_colormap_changed)
+        self.adjust_panel.cutoff_changed.connect(self.on_cutoff_changed)
+        self.adjust_panel.auto_update_changed.connect(self._on_auto_update_toggled)
+        # 旧 attribute alias（calculate_spectrogram などから直接参照されている）
+        self.nfft_spin = self.adjust_panel.nfft_spin
+        self.overlap_spin = self.adjust_panel.overlap_spin
+        self.colormap_combo = self.adjust_panel.colormap_combo
+        self.lower_cutoff_spin = self.adjust_panel.lower_cutoff_spin
+        self.auto_update_checkbox = self.adjust_panel.auto_update_checkbox
+        bottom_layout.addWidget(self.adjust_panel, 1)  # 幅の比率1
 
         # 標準出力+調整パネルをストレッチファクター0で追加（固定高さ）
         main_layout.addWidget(bottom_container, 0)
@@ -341,412 +378,6 @@ class RSIQViewer(QMainWindow):
         # キーボードショートカットの設定
         self.setup_shortcuts()
 
-    def create_file_browser(self):
-        """ファイルブラウザ作成（ディレクトリ + ファイルを統合表示）"""
-        browser_group = QGroupBox("ファイルブラウザ")
-        browser_layout = QVBoxLayout()
-
-        # カレントディレクトリ表示
-        current_dir = Path.cwd()
-        dir_label = QLabel(f"📁 起動ディレクトリ: {current_dir.name}")
-        dir_label.setStyleSheet("font-weight: bold; padding: 5px;")
-        dir_label.setToolTip(str(current_dir))
-        browser_layout.addWidget(dir_label)
-
-        # ファイルシステムモデル（ディレクトリとファイルを両方表示）
-        self.file_model = QFileSystemModel()
-        self.file_model.setRootPath(str(current_dir))
-
-        # ファイルフィルタ設定（ディレクトリ + .wvh + .iq.tar）
-        self.file_model.setNameFilters(["*.wvh", "*.iq.tar"])
-        self.file_model.setNameFilterDisables(False)  # フィルタに一致しないファイルを非表示
-
-        # ディレクトリも表示（"."と".."は非表示、パンくずリストで親ディレクトリへ移動）
-        self.file_model.setFilter(QDir.AllDirs | QDir.Files | QDir.NoDot | QDir.NoDotDot)
-
-        # ツリービュー
-        self.file_tree = QTreeView()
-        self.file_tree.setModel(self.file_model)
-
-        # ソート設定：ディレクトリを先に
-        self.file_tree.setSortingEnabled(True)
-        self.file_model.sort(0, Qt.AscendingOrder)
-
-        # 初期表示はカレントディレクトリのみ（パンくずリストで上位に移動可能）
-        self.current_root_dir = current_dir
-        self.file_tree.setRootIndex(self.file_model.index(str(current_dir)))
-
-        # 列の設定（名前、サイズのみ表示）
-        self.file_tree.setColumnWidth(0, 250)  # 名前
-        self.file_tree.setColumnHidden(2, True)  # Type
-        self.file_tree.setColumnHidden(3, True)  # Date Modified
-
-        # フォントサイズ設定
-        self.file_tree.setStyleSheet(f"""
-            QTreeView {{
-                font-size: {self.font_size_large}pt;
-            }}
-        """)
-
-        # シングルクリックでヘッダー情報表示
-        self.file_tree.clicked.connect(self.on_file_tree_clicked)
-
-        # ダブルクリックで開く
-        self.file_tree.doubleClicked.connect(self.on_file_tree_double_clicked)
-
-        browser_layout.addWidget(self.file_tree)
-
-        # ヘッダー情報表示エリア
-        header_label = QLabel("ファイル情報:")
-        header_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
-        browser_layout.addWidget(header_label)
-
-        self.header_info_text = QTextEdit()
-        self.header_info_text.setReadOnly(True)
-        self.header_info_text.setMinimumHeight(300)  # 最小高さを2倍に
-        self.header_info_text.setStyleSheet(f"""
-            QTextEdit {{
-                background-color: #f5f5f5;
-                color: #333333;
-                font-family: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
-                font-size: {self.font_size_small}pt;
-                border: 1px solid #cccccc;
-                padding: 8px;
-                line-height: 1.0;
-            }}
-        """)
-        self.header_info_text.setPlaceholderText("ファイルを選択するとヘッダー情報が表示されます...")
-        browser_layout.addWidget(self.header_info_text)
-
-        browser_group.setLayout(browser_layout)
-        return browser_group
-
-    def update_breadcrumb(self, current_path):
-        """パンくずリスト（絶対パス）を更新"""
-        # 既存のウィジェットをクリア
-        while self.breadcrumb_layout.count():
-            child = self.breadcrumb_layout.takeAt(0)
-            if child.widget():
-                child.widget().deleteLater()
-
-        # パスを分解
-        path_parts = []
-        temp_path = Path(current_path)
-
-        # ルートまで遡る
-        while True:
-            path_parts.insert(0, temp_path)
-            if temp_path.parent == temp_path:  # ルートに到達
-                break
-            temp_path = temp_path.parent
-
-        # 各階層をボタンとして追加
-        for i, path_part in enumerate(path_parts):
-            # ボタン作成
-            if i == 0:
-                # ルートディレクトリ
-                if sys.platform == 'win32':
-                    # Windows: ドライブ文字 (C:, D:, など)
-                    btn_text = str(path_part)
-                else:
-                    # macOS/Linux: /
-                    btn_text = "/"
-            else:
-                btn_text = path_part.name
-
-            btn = QPushButton(btn_text)
-            btn.setFlat(True)
-            btn.setStyleSheet(f"""
-                QPushButton {{
-                    background-color: transparent;
-                    border: none;
-                    color: #0066cc;
-                    text-align: left;
-                    padding: 2px 5px;
-                    font-size: {self.font_size_large}pt;
-                }}
-                QPushButton:hover {{
-                    background-color: #e6f2ff;
-                    text-decoration: underline;
-                }}
-            """)
-
-            # クリック時に該当パスに移動
-            path_to_move = str(path_part)
-            btn.clicked.connect(lambda checked, p=path_to_move: self.navigate_to_path(p))
-
-            self.breadcrumb_layout.addWidget(btn)
-
-            # 最後以外は区切り文字を追加
-            if i < len(path_parts) - 1:
-                separator = QLabel("/")
-                separator.setStyleSheet(f"color: #888888; font-size: {self.font_size_large}pt;")
-                self.breadcrumb_layout.addWidget(separator)
-
-    def navigate_to_path(self, path_str):
-        """指定されたパスに移動"""
-        target_path = Path(path_str)
-        if target_path.exists() and target_path.is_dir():
-            self.current_root_dir = target_path
-            self.file_tree.setRootIndex(self.file_model.index(str(target_path)))
-            self.update_breadcrumb(target_path)
-            self.status_label.setText(f"📁 {target_path}")
-
-    def on_file_tree_clicked(self, index):
-        """ツリービューでクリック時の処理（ヘッダー情報表示）"""
-        file_path = Path(self.file_model.filePath(index))
-
-        # ディレクトリの場合は何もしない
-        if file_path.is_dir():
-            self.header_info_text.clear()
-            self.header_info_text.setPlaceholderText("ディレクトリが選択されています...")
-            return
-
-        # ファイルの場合はヘッダー情報を表示
-        if file_path.suffix in ['.wvh', '.tar'] or str(file_path).endswith('.iq.tar'):
-            self.display_file_header(file_path)
-
-    def display_file_header(self, file_path):
-        """ファイルのヘッダー情報を整形して表示"""
-        try:
-            # ファイル名の表示幅を計算（絵文字 + スペース + ファイル名）
-            # 絵文字は2文字幅、ASCIIは1文字幅、日本語等は2文字幅として計算
-            display_name = f"📄 {file_path.name}"
-            display_width = 0
-            for char in display_name:
-                # ord(char) > 127 は非ASCII文字（日本語、絵文字等）
-                # 簡易的に、非ASCII文字は2幅、ASCII文字は1幅
-                if ord(char) > 127:
-                    display_width += 2
-                else:
-                    display_width += 1
-
-            header_text = f"{display_name}\n"
-            header_text += "=" * display_width + "\n\n"
-
-            if file_path.suffix == '.wvh':
-                # WVHファイルのヘッダー読み込み
-                temp_loader = WVFileLoader()
-                header = temp_loader.parse_wvh(str(file_path))
-
-                # ファイルサイズ
-                wvd_path = file_path.with_suffix('.wvd')
-                if wvd_path.exists():
-                    size_gb = wvd_path.stat().st_size / 1e9
-                    header_text += f"WVDサイズ:        {size_gb:.2f} GB\n"
-
-                # 基本情報
-                header_text += f"フォーマット:     {header.get('TYPE', 'N/A')}\n"
-                header_text += f"コンポーネント:   {header.get('COMPONENTS', 'N/A')}\n"
-                header_text += f"分解能:           {header.get('RESOLUTION', 'N/A')} bit\n\n"
-
-                # サンプリング情報
-                samples = header.get('SAMPLES', 0)
-                clock = header.get('CLOCK', 0)
-                header_text += f"サンプル数:       {samples:,}\n"
-                header_text += f"サンプリング周波数: {clock/1e6:.2f} MHz\n"
-
-                # 継続時間計算
-                if clock > 0:
-                    duration_sec = samples / clock
-                    if duration_sec < 1e-3:
-                        duration_str = f"{duration_sec*1e6:.2f} μs"
-                    elif duration_sec < 1:
-                        duration_str = f"{duration_sec*1e3:.2f} ms"
-                    else:
-                        duration_str = f"{duration_sec:.3f} s"
-                    header_text += f"継続時間:         {duration_str}\n\n"
-
-                # 周波数情報
-                frequency = header.get('FREQUENCY', 0)
-                header_text += f"中心周波数:       {frequency/1e6:.2f} MHz\n"
-                if clock > 0:
-                    bandwidth = clock
-                    header_text += f"瞬時帯域幅:       {bandwidth/1e6:.2f} MHz\n"
-                    header_text += f"周波数範囲:       {(frequency-bandwidth/2)/1e6:.2f} - {(frequency+bandwidth/2)/1e6:.2f} MHz\n\n"
-
-                # その他の情報
-                if 'DATE' in header:
-                    header_text += f"日付:             {header['DATE']}\n"
-                if 'FWVERSION' in header:
-                    header_text += f"ファームウェア:   {header['FWVERSION']}\n"
-                if 'CHANNAME0' in header:
-                    header_text += f"チャンネル名:     {header['CHANNAME0']}\n"
-
-            elif str(file_path).endswith('.iq.tar'):
-                # iq.tarファイルのヘッダー読み込み
-                temp_loader = IQTarLoader()
-                header = temp_loader.parse_iqtar(str(file_path))
-
-                # ファイルサイズ
-                size_gb = file_path.stat().st_size / 1e9
-                header_text += f"ファイルサイズ:   {size_gb:.2f} GB\n\n"
-
-                # 基本情報
-                header_text += f"フォーマット:     iq.tar (float32)\n"
-                header_text += f"コンポーネント:   IQ\n\n"
-
-                # サンプリング情報
-                samples = header.get('SAMPLES', 0)
-                clock = header.get('CLOCK', 0)
-                header_text += f"サンプル数:       {samples:,}\n"
-                header_text += f"サンプリング周波数: {clock/1e6:.2f} MHz\n"
-
-                # 継続時間計算
-                if clock > 0:
-                    duration_sec = samples / clock
-                    if duration_sec < 1e-3:
-                        duration_str = f"{duration_sec*1e6:.2f} μs"
-                    elif duration_sec < 1:
-                        duration_str = f"{duration_sec*1e3:.2f} ms"
-                    else:
-                        duration_str = f"{duration_sec:.3f} s"
-                    header_text += f"継続時間:         {duration_str}\n\n"
-
-                # 周波数情報
-                frequency = header.get('FREQUENCY', 0)
-                header_text += f"中心周波数:       {frequency/1e6:.2f} MHz\n"
-                if clock > 0:
-                    bandwidth = clock
-                    header_text += f"瞬時帯域幅:       {bandwidth/1e6:.2f} MHz\n"
-                    header_text += f"周波数範囲:       {(frequency-bandwidth/2)/1e6:.2f} - {(frequency+bandwidth/2)/1e6:.2f} MHz\n"
-
-                # 一時ディレクトリをクリーンアップ
-                temp_loader.close()
-
-            self.header_info_text.setPlainText(header_text)
-
-        except Exception as e:
-            error_text = f"❌ ヘッダー読み込みエラー\n\n"
-            error_text += f"ファイル: {file_path.name}\n"
-            error_text += f"エラー: {str(e)}"
-            self.header_info_text.setPlainText(error_text)
-
-    def on_file_tree_double_clicked(self, index):
-        """
-        ツリービューでダブルクリック時の処理
-
-        注: ".."はQDir.NoDotDotで非表示にしているため、
-        親ディレクトリへの移動はパンくずリストから行う。
-        """
-        file_path = Path(self.file_model.filePath(index))
-
-        # サブディレクトリの場合は、そのディレクトリをルートにする
-        if file_path.is_dir():
-            self.current_root_dir = file_path
-            self.file_tree.setRootIndex(self.file_model.index(str(file_path)))
-            self.update_breadcrumb(file_path)
-            self.status_label.setText(f"📁 {file_path}")
-            return
-
-        # ファイルの場合は読み込み
-        if file_path.suffix in ['.wvh', '.tar'] or str(file_path).endswith('.iq.tar'):
-            # ファイルの親ディレクトリに移動してパンくずリストを更新
-            parent_dir = file_path.parent
-            self.current_root_dir = parent_dir
-            self.file_tree.setRootIndex(self.file_model.index(str(parent_dir)))
-            self.update_breadcrumb(parent_dir)
-
-            self.status_label.setText(f"📄 読み込み中: {file_path.name}")
-            self.load_file(str(file_path))
-
-    def create_control_panel(self):
-        """コントロールパネル作成"""
-        # グループボックスなしで直接レイアウト
-        container = QWidget()
-        layout = QHBoxLayout()
-        layout.setContentsMargins(0, 0, 0, 0)
-
-        # パンくずリスト（左寄せ・コンパクト表示）
-        breadcrumb_container = QWidget()
-        breadcrumb_layout = QHBoxLayout(breadcrumb_container)
-        breadcrumb_layout.setContentsMargins(0, 5, 0, 5)
-        breadcrumb_layout.setSpacing(0)
-        breadcrumb_layout.setAlignment(Qt.AlignLeft)  # 左寄せ
-
-        self.breadcrumb_layout = breadcrumb_layout
-
-        # 初期パンくずリストを設定（ファイル読み込み時に更新）
-        current_dir = Path.cwd()
-        self.current_root_dir = current_dir
-        self.update_breadcrumb(current_dir)
-
-        # パンくずリストを左寄せでコンパクトに配置（ストレッチなし）
-        layout.addWidget(breadcrumb_container, 0)
-
-        # スペーサー（ボタンを右端に固定）
-        layout.addStretch()
-
-        # スペクトログラム計算ボタン
-        self.calc_spec_btn = QPushButton("📊 スペクトログラム計算")
-        self.calc_spec_btn.clicked.connect(self.calculate_spectrogram)
-        self.calc_spec_btn.setEnabled(False)
-        self.calc_spec_btn.setToolTip("選択したRegion範囲のスペクトログラムを手動計算\n自動更新がOFFの場合に使用")
-        self.calc_spec_btn.setFixedHeight(self.button_height)
-        self.calc_spec_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #4CAF50;
-                color: white;
-                font-weight: bold;
-                font-size: {self.font_size_large}pt;
-                padding: 5px 15px;
-            }}
-            QPushButton:hover {{
-                background-color: #45A049;
-            }}
-            QPushButton:disabled {{
-                background-color: #cccccc;
-                color: #666666;
-            }}
-        """)
-        layout.addWidget(self.calc_spec_btn)
-
-        # Saveボタン
-        self.save_btn = QPushButton("💾 保存")
-        self.save_btn.clicked.connect(self.save_region)
-        self.save_btn.setEnabled(False)
-        self.save_btn.setToolTip("選択したRegion範囲をWVH/WVD形式で保存")
-        self.save_btn.setFixedHeight(self.button_height)
-        self.save_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #00BCD4;
-                color: white;
-                font-weight: bold;
-                font-size: {self.font_size_large}pt;
-                padding: 5px 15px;
-            }}
-            QPushButton:hover {{
-                background-color: #0097A7;
-            }}
-            QPushButton:disabled {{
-                background-color: #cccccc;
-                color: #666666;
-            }}
-        """)
-        layout.addWidget(self.save_btn)
-
-        # 終了ボタン
-        self.exit_btn = QPushButton("🚪 終了")
-        self.exit_btn.clicked.connect(self.safe_exit)
-        self.exit_btn.setToolTip("アプリケーションを終了 (Ctrl+Q / Cmd+Q)")
-        self.exit_btn.setFixedHeight(self.button_height)
-        self.exit_btn.setStyleSheet(f"""
-            QPushButton {{
-                background-color: #f44336;
-                color: white;
-                font-weight: bold;
-                font-size: {self.font_size_large}pt;
-                padding: 5px 15px;
-            }}
-            QPushButton:hover {{
-                background-color: #d32f2f;
-            }}
-        """)
-        layout.addWidget(self.exit_btn)
-
-        container.setLayout(layout)
-        container.setMaximumHeight(self.control_panel_height)
-        return container
 
     def setup_shortcuts(self):
         """
@@ -763,83 +394,6 @@ class RSIQViewer(QMainWindow):
         shortcut_quit = QShortcut(QKeySequence.StandardKey.Quit, self)
         shortcut_quit.activated.connect(self.safe_exit)
 
-    def create_adjustment_panel(self):
-        """調整パネル作成"""
-        group = QGroupBox("表示調整")
-        layout = QVBoxLayout()
-
-        # 自動更新チェックボックス
-        self.auto_update_checkbox = QCheckBox("Region変更時に自動更新")
-        self.auto_update_checkbox.setChecked(False)
-        self.auto_update_checkbox.setToolTip("ONにするとRegion範囲変更時にスペクトログラムも自動計算")
-        self.auto_update_checkbox.stateChanged.connect(self.on_auto_update_changed)
-        layout.addWidget(self.auto_update_checkbox)
-
-        # 区切り線
-        from PySide6.QtWidgets import QFrame
-        line = QFrame()
-        line.setFrameShape(QFrame.HLine)
-        line.setFrameShadow(QFrame.Sunken)
-        layout.addWidget(line)
-
-        # カラーマップ選択
-        color_layout = QHBoxLayout()
-        color_layout.addWidget(QLabel("カラーマップ:"))
-        self.colormap_combo = QComboBox()
-        self.colormap_combo.addItems(['plasma', 'viridis', 'inferno', 'magma'])
-        self.colormap_combo.currentTextChanged.connect(self.on_colormap_changed)
-        color_layout.addWidget(self.colormap_combo)
-        layout.addLayout(color_layout)
-
-        # NFFT設定
-        nfft_layout = QHBoxLayout()
-        nfft_layout.addWidget(QLabel("NFFT:"))
-        self.nfft_spin = QSpinBox()
-        self.nfft_spin.setRange(64, 8192)
-        self.nfft_spin.setSingleStep(64)
-        self.nfft_spin.setValue(256)
-        self.nfft_spin.setToolTip("スペクトログラムのFFTサイズ")
-        nfft_layout.addWidget(self.nfft_spin)
-        layout.addLayout(nfft_layout)
-
-        # オーバーラップ
-        overlap_layout = QHBoxLayout()
-        overlap_layout.addWidget(QLabel("オーバーラップ:"))
-        self.overlap_spin = QSpinBox()
-        self.overlap_spin.setRange(0, 90)
-        self.overlap_spin.setSingleStep(10)
-        self.overlap_spin.setValue(50)
-        self.overlap_spin.setSuffix("%")
-        self.overlap_spin.setToolTip("スペクトログラムのオーバーラップ率")
-        overlap_layout.addWidget(self.overlap_spin)
-        layout.addLayout(overlap_layout)
-
-        # 区切り線
-        line2 = QFrame()
-        line2.setFrameShape(QFrame.HLine)
-        line2.setFrameShadow(QFrame.Sunken)
-        layout.addWidget(line2)
-
-        # 下位カットオフ調整（ノイズフロア除去）
-        cutoff_label = QLabel("下位カットオフ:")
-        cutoff_label.setToolTip("ノイズフロアをカットして小信号を強調\n大きい値でノイズを除去")
-        layout.addWidget(cutoff_label)
-
-        cutoff_layout = QHBoxLayout()
-        self.lower_cutoff_spin = QSpinBox()
-        self.lower_cutoff_spin.setRange(0, 50)
-        self.lower_cutoff_spin.setSingleStep(1)
-        self.lower_cutoff_spin.setValue(0)  # デフォルト: 0%（カットなし）
-        self.lower_cutoff_spin.setSuffix(" %")
-        self.lower_cutoff_spin.setToolTip("下位何%をカットするか\n0% = カットなし（全表示）\n1% = 軽度のノイズ除去\n3-5% = 中程度のノイズ除去\n10%以上 = 強力なノイズ除去")
-        self.lower_cutoff_spin.valueChanged.connect(self.on_cutoff_changed)
-        cutoff_layout.addWidget(self.lower_cutoff_spin)
-        layout.addLayout(cutoff_layout)
-
-        layout.addStretch()
-
-        group.setLayout(layout)
-        return group
 
     def cleanup_previous_data(self):
         """
@@ -2048,24 +1602,17 @@ class RSIQViewer(QMainWindow):
                 f"font-size: {self.font_size_large}pt; padding: 5px; color: #888888;"
             )
 
-    def on_auto_update_changed(self, state):
-        """
-        自動更新チェックボックス変更時の処理
+    def _on_breadcrumb_clicked(self, path):
+        """パンくずリストのボタンが押されたら FileBrowserPanel に伝える。"""
+        self.file_browser.set_root_dir(path)
 
-        Args:
-            state: チェック状態（Qt.Checked または Qt.Unchecked）
-        """
-        from PySide6.QtCore import Qt
-        self.auto_update_spectrogram = (state == Qt.CheckState.Checked.value)
-
+    def _on_auto_update_toggled(self, enabled):
+        """AdjustmentPanel.auto_update_changed (bool) ハンドラ。"""
+        self.auto_update_spectrogram = bool(enabled)
         if self.auto_update_spectrogram:
-            # ONにした瞬間に一度計算
             if self.total_samples > 0 and self.region_start < self.region_end:
                 self.calculate_spectrogram()
-        else:
-            pass  # 自動更新OFF
-
-        # ステータス更新
+        # ステータス再描画
         self.on_region_changed()
 
 
