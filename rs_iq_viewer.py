@@ -1,0 +1,3595 @@
+#!/usr/bin/env python3
+"""
+Rohde & Schwarz IQデータビューワー
+大容量IQデータ（最大20GB）を効率的に処理するメモリ最適化版
+
+ターゲット環境: Windows 11, Core i3, RAM 8GB
+データ形式: WVH/WVDファイル（Rohde & Schwarz IQW）
+"""
+
+import sys
+import numpy as np
+from pathlib import Path
+import struct
+import re
+import tarfile
+import xml.etree.ElementTree as ET
+import tempfile
+import shutil
+import psutil
+import threading
+from PySide6.QtWidgets import (
+    QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
+    QPushButton, QFileDialog, QLabel, QSplitter, QDoubleSpinBox,
+    QComboBox, QGroupBox, QMessageBox, QSpinBox, QCheckBox, QTextEdit,
+    QTreeView, QFileSystemModel, QScrollArea, QSizePolicy, QMenu
+)
+from PySide6.QtCore import Qt, QRectF, Signal, QObject, QDir, QTimer, QCoreApplication
+from PySide6.QtGui import QScreen, QKeySequence, QShortcut, QTextCursor
+
+# PyQtGraphのインポート
+import pyqtgraph as pg
+from scipy import signal as scipy_signal
+
+# ダークテーマ（オプショナル）
+try:
+    import qdarktheme
+    HAS_DARKTHEME = True
+except ImportError:
+    HAS_DARKTHEME = False
+
+
+class StdoutRedirector(QObject):
+    """
+    標準出力をキャプチャしてQtシグナルとして送信するクラス
+
+    使用方法:
+        redirector = StdoutRedirector()
+        redirector.text_written.connect(text_widget.append)
+        sys.stdout = redirector
+    """
+    text_written = Signal(str)
+
+    def __init__(self, original_stdout=None):
+        super().__init__()
+        self.original_stdout = original_stdout or sys.stdout
+
+    def write(self, text):
+        """
+        標準出力のwrite()メソッドをオーバーライド
+
+        注: ここではprocessEvents()を呼ばない。
+        イベント処理はappend_stdout()側で行う。
+        write()内でprocessEvents()を呼ぶと、初期化中に
+        再帰的なイベント処理が発生してsegmentation faultの原因になる。
+        """
+        if text.strip():  # 空白文字のみの行は無視
+            self.text_written.emit(text)
+        # オリジナルの標準出力にも書き込む（デバッグ用）
+        if self.original_stdout:
+            self.original_stdout.write(text)
+
+    def flush(self):
+        """flush()メソッド（互換性のため）"""
+        if self.original_stdout:
+            self.original_stdout.flush()
+
+
+class WVFileLoader:
+    """
+    Rohde & Schwarz WVH/WVDファイルローダー
+
+    メモリ効率のため、numpyのmemmapを使用して大容量ファイルを扱う。
+    実際のデータは必要な時にのみアクセスする遅延読み込み方式。
+
+    スレッドセーフティ:
+    メモリマップへの並行アクセスを防ぐため、スレッドロックを使用。
+    """
+
+    def __init__(self):
+        self.header = {}
+        self.data_memmap = None
+        self.wvd_path = None
+        self.wvh_path = None
+        # スレッドロック（メモリマップアクセスの排他制御）
+        self._lock = threading.Lock()
+
+    def parse_wvh(self, wvh_path):
+        """
+        WVHヘッダーファイルを解析
+
+        フォーマット例:
+        {COPYRIGHT:2025 Rohde&Schwarz IQW}
+        {TYPE:RAW16LE}
+        {CLOCK:32000000.000000}
+        {SAMPLES:2837446656}
+
+        Args:
+            wvh_path: WVHファイルパス
+
+        Returns:
+            dict: ヘッダー情報
+        """
+        wvh_path = Path(wvh_path)
+        self.wvh_path = wvh_path
+
+        if not wvh_path.exists():
+            raise FileNotFoundError(f"WVHファイルが見つかりません: {wvh_path}")
+
+        # ヘッダーファイル読み込み（通常は数KB程度なのでメモリに読み込み可）
+        with open(wvh_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+
+        # {KEY:VALUE} 形式をパース
+        pattern = r'\{([^:]+):([^}]+)\}'
+        matches = re.findall(pattern, content)
+
+        header = {}
+        for key, value in matches:
+            header[key] = value
+
+        # 必須パラメータの検証
+        required_keys = ['TYPE', 'SAMPLES', 'CLOCK']
+        for key in required_keys:
+            if key not in header:
+                raise ValueError(f"必須ヘッダー情報が不足: {key}")
+
+        # 数値型への変換
+        header['SAMPLES'] = int(header['SAMPLES'])
+        header['CLOCK'] = float(header['CLOCK'])
+
+        if 'FREQUENCY' in header:
+            header['FREQUENCY'] = float(header['FREQUENCY'])
+        else:
+            header['FREQUENCY'] = 0.0
+
+        if 'RESOLUTION' in header:
+            header['RESOLUTION'] = int(header['RESOLUTION'])
+        else:
+            header['RESOLUTION'] = 16
+
+        if 'REFLEVEL' in header:
+            # REFLEVELは浮動小数点数（dBm単位）
+            header['REFLEVEL'] = float(header['REFLEVEL'])
+        else:
+            header['REFLEVEL'] = 0.0
+
+        self.header = header
+
+        # 対応するWVDファイルのパス
+        self.wvd_path = wvh_path.with_suffix('.wvd')
+
+        if not self.wvd_path.exists():
+            raise FileNotFoundError(f"WVDファイルが見つかりません: {self.wvd_path}")
+
+        return header
+
+    def open_wvd(self):
+        """
+        WVDファイルをメモリマップとして開く
+
+        メモリマップを使用することで、実際のメモリ使用量を最小限に抑える。
+        OSのページングメカニズムにより、必要な部分だけがRAMにロードされる。
+
+        重要: ヘッダーのSAMPLES値が不正確な場合があるため、
+        実際のファイルサイズから正しいサンプル数を計算する。
+
+        Returns:
+            np.memmap: メモリマップされたIQデータ（複素数配列）
+        """
+        if self.wvd_path is None:
+            raise RuntimeError("先にparse_wvh()を実行してください")
+
+        # データ型の決定
+        if self.header['TYPE'] == 'RAW16LE':
+            # 16ビットリトルエンディアン形式
+            # IQデータなので、I(実部)とQ(虚部)がインターリーブされている
+            dtype = np.int16
+            bytes_per_element = 2
+        else:
+            raise ValueError(f"未対応のデータ型: {self.header['TYPE']}")
+
+        # 実際のファイルサイズを取得
+        actual_file_size = self.wvd_path.stat().st_size
+
+        # ファイルサイズから実際の要素数を計算
+        # IQデータ: I, Qがインターリーブされているので、要素数は2倍
+        actual_elements = actual_file_size // bytes_per_element
+
+        # ヘッダーから期待される要素数
+        header_elements = self.header['SAMPLES'] * 2  # I, Q
+
+        # 整合性チェック
+        if actual_elements != header_elements:
+                
+            # 実際のサンプル数で上書き
+            self.header['SAMPLES'] = actual_elements // 2
+
+            # WVHファイルを自動修正するかフラグを設定
+            # （後でfix_wvh_header()を呼び出す）
+            self.header_mismatch = True
+        else:
+            self.header_mismatch = False
+
+        # メモリマップとして開く（読み取り専用）
+        # 実際のファイルサイズに基づいた要素数を使用
+        self.data_memmap = np.memmap(
+            self.wvd_path,
+            dtype=dtype,
+            mode='r',
+            shape=(actual_elements,)
+        )
+
+
+        return self.data_memmap
+
+    def get_iq_data(self, start_sample=0, end_sample=None):
+        """
+        指定範囲のIQデータを複素数配列として取得
+
+        メモリ効率のため、必要な範囲のみを読み込む。
+        大容量データでも安全に扱えるよう、範囲チェックを厳密に行う。
+
+        スレッドセーフティ:
+        メモリマップへの並行アクセスを防ぐため、スレッドロックで保護。
+
+        Args:
+            start_sample: 開始サンプル番号
+            end_sample: 終了サンプル番号（Noneの場合は最後まで）
+
+        Returns:
+            np.ndarray: 複素数配列 (dtype=complex64)
+        """
+        with self._lock:
+            if self.data_memmap is None:
+                raise RuntimeError("先にopen_wvd()を実行してください")
+
+            if end_sample is None:
+                end_sample = self.header['SAMPLES']
+
+            # 範囲チェック
+            start_sample = max(0, start_sample)
+            end_sample = min(self.header['SAMPLES'], end_sample)
+
+            if start_sample >= end_sample:
+                raise ValueError(f"無効な範囲: start={start_sample}, end={end_sample}")
+
+            # IQデータの読み込み
+            # インターリーブされたI, Qデータを複素数に変換
+            # [I0, Q0, I1, Q1, ...] -> [I0+j*Q0, I1+j*Q1, ...]
+            start_idx = start_sample * 2
+            end_idx = end_sample * 2
+
+            # メモリマップからデータを読み込み
+            # コピーを作成してメモリマップへの参照を残さない
+            iq_interleaved = np.array(self.data_memmap[start_idx:end_idx], dtype=np.int16)
+
+        # ロック外で配列変換を実行（メモリマップへのアクセスは完了済み）
+        # I成分とQ成分に分離
+        i_data = iq_interleaved[0::2].astype(np.float32)
+        q_data = iq_interleaved[1::2].astype(np.float32)
+
+        # 複素数配列に変換
+        # float32を使用することでメモリ使用量をfloat64の半分に削減
+        iq_complex = i_data + 1j * q_data
+
+        # 元の配列への参照を削除
+        del iq_interleaved, i_data, q_data
+
+        return iq_complex
+
+    def fix_wvh_header(self):
+        """
+        WVHヘッダーファイルを実際のWVDサイズに合わせて修正
+
+        元のWVHファイルは .bak として保存される。
+        """
+        if self.wvh_path is None:
+            raise RuntimeError("WVHファイルが読み込まれていません")
+
+        # バックアップファイル作成
+        backup_path = self.wvh_path.with_suffix('.wvh.bak')
+
+        # 既存のバックアップがある場合は上書き
+        if backup_path.exists():
+            pass  # 既存バックアップを上書き
+
+        # バックアップ保存
+        import shutil
+        shutil.copy2(self.wvh_path, backup_path)
+
+        # 新しいWVHファイル作成
+        self.write_wvh_header(self.wvh_path, self.header)
+
+    @staticmethod
+    def write_wvh_header(wvh_path, header):
+        """
+        WVHヘッダーファイルを書き込む
+
+        Args:
+            wvh_path: 保存先WVHファイルパス
+            header: ヘッダー辞書
+        """
+        from datetime import datetime
+
+        # ヘッダー内容生成
+        # Rohde & Schwarz標準フォーマットに準拠
+        wvh_content = ""
+
+        # 必須フィールド
+        wvh_content += "{COPYRIGHT:2025 Rohde&Schwarz IQW}"
+
+        if 'FWVERSION' in header:
+            wvh_content += "{FWVERSION:" + str(header['FWVERSION']) + "}"
+        else:
+            wvh_content += "{FWVERSION:3.2.3}"
+
+        if 'DATE' in header:
+            wvh_content += "{DATE:" + str(header['DATE']) + "}"
+        else:
+            # 現在日時を使用
+            now = datetime.now()
+            date_str = now.strftime("%Y-%m-%d;%H:%M:%S")
+            wvh_content += "{DATE:" + date_str + "}"
+
+        wvh_content += "{TYPE:" + str(header.get('TYPE', 'RAW16LE')) + "}"
+        wvh_content += "{COMPONENTS:" + str(header.get('COMPONENTS', 'IQ')) + "}"
+        wvh_content += "{CLOCK:" + f"{header['CLOCK']:.6f}" + "}"
+
+        if 'CHANNAME0' in header:
+            wvh_content += "{CHANNAME0:" + str(header['CHANNAME0']) + "}"
+
+        wvh_content += "{RESOLUTION:" + str(header.get('RESOLUTION', 16)) + "}"
+        wvh_content += "{FREQUENCY:" + f"{header.get('FREQUENCY', 0.0):.6f}" + "}"
+
+        # REFLEVELは浮動小数点数として出力（dBm単位）
+        reflevel = header.get('REFLEVEL', 0.0)
+        if isinstance(reflevel, (int, float)):
+            wvh_content += "{REFLEVEL:" + f"{float(reflevel):.6f}" + "}"
+        else:
+            wvh_content += "{REFLEVEL:0.000000}"
+
+        wvh_content += "{SAMPLES:" + str(header['SAMPLES']) + "}"
+
+        # ファイルに書き込み
+        with open(wvh_path, 'w', encoding='utf-8') as f:
+            f.write(wvh_content)
+
+    @staticmethod
+    def save_region_as_wv(save_path, iq_data, header_template):
+        """
+        Region範囲のIQデータをWVH/WVD形式で保存
+
+        Args:
+            save_path: 保存先パス（拡張子なし、または.wvh/.wvd）
+            iq_data: 複素数IQデータ配列
+            header_template: ベースとなるヘッダー情報
+        """
+        save_path = Path(save_path)
+
+        # 拡張子を削除してベースパスを取得
+        if save_path.suffix in ['.wvh', '.wvd']:
+            base_path = save_path.with_suffix('')
+        else:
+            base_path = save_path
+
+        wvh_path = base_path.with_suffix('.wvh')
+        wvd_path = base_path.with_suffix('.wvd')
+
+        # ヘッダー情報を更新
+        new_header = header_template.copy()
+        new_header['SAMPLES'] = len(iq_data)
+
+        # WVDファイル保存（バイナリ、RAW16LE形式）
+        # 複素数データをI, Qインターリーブ形式に変換
+        i_data = np.real(iq_data).astype(np.int16)
+        q_data = np.imag(iq_data).astype(np.int16)
+
+        # インターリーブ: [I0, Q0, I1, Q1, ...]
+        interleaved = np.empty(len(iq_data) * 2, dtype=np.int16)
+        interleaved[0::2] = i_data
+        interleaved[1::2] = q_data
+
+        # WVDファイルに書き込み
+        with open(wvd_path, 'wb') as f:
+            interleaved.tofile(f)
+
+
+        # WVHヘッダーファイル保存
+        WVFileLoader.write_wvh_header(wvh_path, new_header)
+
+        return wvh_path, wvd_path
+
+    def close(self):
+        """
+        メモリマップを安全にクローズ
+
+        Segmentation fault回避のため、適切な順序で解放する。
+        別のファイルを開く前に必ず実行すること。
+        """
+        if self.data_memmap is not None:
+            try:
+                # メモリマップへの参照をクリア
+                # 直接delする前にNoneを代入することで参照カウントを減らす
+                memmap_ref = self.data_memmap
+                self.data_memmap = None
+
+                # フラッシュして同期
+                if hasattr(memmap_ref, '_mmap') and memmap_ref._mmap is not None:
+                    try:
+                        memmap_ref._mmap.close()
+                    except:
+                        pass
+
+                # 明示的に削除
+                del memmap_ref
+
+                # ガベージコレクション（即座に解放）
+                import gc
+                gc.collect()
+
+            except Exception as e:
+                pass  # エラーは無視して続行
+
+        # 内部状態もリセット
+        self.header = {}
+        self.wvd_path = None
+        self.wvh_path = None
+
+
+class IQTarLoader:
+    """
+    Rohde & Schwarz iq.tarファイルローダー
+
+    iq.tarファイルはtarアーカイブで、以下を含む:
+    - XMLメタデータファイル (*.xml)
+    - バイナリIQデータファイル (*.complex*.float32 など)
+    - XSLTスタイルシートファイル (*.xslt)
+
+    メモリ効率のため、tarを一時ディレクトリに展開し、
+    バイナリデータはnumpyのmemmapを使用して遅延読み込み。
+
+    スレッドセーフティ:
+    メモリマップへの並行アクセスを防ぐため、スレッドロックを使用。
+    """
+
+    def __init__(self):
+        self.header = {}
+        self.data_memmap = None
+        self.tar_path = None
+        self.temp_dir = None
+        self.data_file_path = None
+        self.xml_file_path = None
+        # スレッドロック（メモリマップアクセスの排他制御）
+        self._lock = threading.Lock()
+
+    def parse_iqtar(self, tar_path):
+        """
+        iq.tarファイルを解析
+
+        Args:
+            tar_path: iq.tarファイルパス
+
+        Returns:
+            dict: メタデータ情報
+        """
+        tar_path = Path(tar_path)
+        self.tar_path = tar_path
+
+        if not tar_path.exists():
+            raise FileNotFoundError(f"iq.tarファイルが見つかりません: {tar_path}")
+
+        # 一時ディレクトリ作成
+        self.temp_dir = tempfile.mkdtemp(prefix='iqtar_')
+
+        # tarファイル展開
+        try:
+            with tarfile.open(tar_path, 'r') as tar:
+                tar.extractall(self.temp_dir)
+        except Exception as e:
+            raise RuntimeError(f"tarファイル展開エラー: {e}")
+
+        # 展開されたファイルを検索
+        temp_path = Path(self.temp_dir)
+        xml_files = list(temp_path.glob('*.xml'))
+
+        if not xml_files:
+            raise FileNotFoundError("XMLメタデータファイルが見つかりません")
+
+        self.xml_file_path = xml_files[0]
+
+        # XMLパース
+        try:
+            tree = ET.parse(self.xml_file_path)
+            root = tree.getroot()
+
+            # メタデータ抽出
+            header = {}
+
+            # 基本情報
+            name_elem = root.find('Name')
+            header['NAME'] = name_elem.text if name_elem is not None else 'Unknown'
+
+            samples_elem = root.find('Samples')
+            header['SAMPLES'] = int(samples_elem.text) if samples_elem is not None else 0
+
+            clock_elem = root.find('Clock')
+            header['CLOCK'] = float(clock_elem.text) if clock_elem is not None else 1.0
+
+            format_elem = root.find('Format')
+            header['FORMAT'] = format_elem.text if format_elem is not None else 'complex'
+
+            datatype_elem = root.find('DataType')
+            header['DATATYPE'] = datatype_elem.text if datatype_elem is not None else 'float32'
+
+            datafile_elem = root.find('DataFilename')
+            if datafile_elem is not None:
+                header['DATAFILENAME'] = datafile_elem.text
+            else:
+                raise ValueError("DataFilename要素が見つかりません")
+
+            # 中心周波数（UserData内）
+            # パス: UserData/RohdeSchwarz/DataImportExport_MandatoryData/CenterFrequency
+            ns = {'rs': 'http://www.rohde-schwarz.com'}  # 名前空間は使われていない場合が多い
+            center_freq = 0.0
+
+            # 複数の可能なパスを試行
+            userdata = root.find('.//UserData')
+            if userdata is not None:
+                rs_elem = userdata.find('.//RohdeSchwarz')
+                if rs_elem is not None:
+                    # MandatoryData内のCenterFrequency
+                    mandatory_data = rs_elem.find('.//DataImportExport_MandatoryData')
+                    if mandatory_data is not None:
+                        cf_elem = mandatory_data.find('.//CenterFrequency')
+                        if cf_elem is not None:
+                            center_freq = float(cf_elem.text)
+
+                    # 古いフォーマット（SpectrumAnalyzer内）
+                    if center_freq == 0.0:
+                        sa_elem = rs_elem.find('.//SpectrumAnalyzer')
+                        if sa_elem is not None:
+                            cf_elem = sa_elem.find('.//CenterFrequency')
+                            if cf_elem is not None:
+                                center_freq = float(cf_elem.text)
+
+            header['FREQUENCY'] = center_freq
+
+            # REFLEVEL（OptionalData内のKey name="Ch1_RefLevel[dBm]"）
+            reflevel = 0.0
+            if userdata is not None:
+                rs_elem = userdata.find('.//RohdeSchwarz')
+                if rs_elem is not None:
+                    optional_data = rs_elem.find('.//DataImportExport_OptionalData')
+                    if optional_data is not None:
+                        for key_elem in optional_data.findall('.//Key'):
+                            if key_elem.get('name') == 'Ch1_RefLevel[dBm]':
+                                reflevel = float(key_elem.text)
+                                break
+
+            header['REFLEVEL'] = reflevel
+
+            self.header = header
+
+            # バイナリデータファイルのパス
+            self.data_file_path = temp_path / header['DATAFILENAME']
+
+            if not self.data_file_path.exists():
+                raise FileNotFoundError(f"バイナリデータファイルが見つかりません: {self.data_file_path}")
+
+                        
+            return header
+
+        except ET.ParseError as e:
+            raise RuntimeError(f"XML解析エラー: {e}")
+        except Exception as e:
+            raise RuntimeError(f"メタデータ解析エラー: {e}")
+
+    def open_data(self):
+        """
+        バイナリIQデータファイルをメモリマップとして開く
+
+        Returns:
+            np.memmap: メモリマップされたIQデータ
+        """
+        if self.data_file_path is None:
+            raise RuntimeError("先にparse_iqtar()を実行してください")
+
+        # データ型の決定
+        datatype = self.header['DATATYPE']
+        format_type = self.header['FORMAT']
+
+        if datatype == 'float32':
+            dtype = np.float32
+            bytes_per_element = 4
+        elif datatype == 'float64':
+            dtype = np.float64
+            bytes_per_element = 8
+        else:
+            raise ValueError(f"未対応のデータ型: {datatype}")
+
+        # 実際のファイルサイズを取得
+        actual_file_size = self.data_file_path.stat().st_size
+
+        # ファイルサイズから実際の要素数を計算
+        actual_elements = actual_file_size // bytes_per_element
+
+        # complex形式の場合、I,Qがインターリーブされている
+        if format_type == 'complex':
+            expected_elements = self.header['SAMPLES'] * 2  # I, Q
+        else:
+            expected_elements = self.header['SAMPLES']
+
+        # 整合性チェック
+        if actual_elements != expected_elements:
+                
+            # 実際のサンプル数で上書き
+            if format_type == 'complex':
+                self.header['SAMPLES'] = actual_elements // 2
+            else:
+                self.header['SAMPLES'] = actual_elements
+
+        # メモリマップとして開く（読み取り専用）
+        self.data_memmap = np.memmap(
+            self.data_file_path,
+            dtype=dtype,
+            mode='r',
+            shape=(actual_elements,)
+        )
+
+
+        return self.data_memmap
+
+    def get_iq_data(self, start_sample=0, end_sample=None):
+        """
+        指定範囲のIQデータを複素数配列として取得
+
+        スレッドセーフティ:
+        メモリマップへの並行アクセスを防ぐため、スレッドロックで保護。
+
+        Args:
+            start_sample: 開始サンプル番号
+            end_sample: 終了サンプル番号（Noneの場合は最後まで）
+
+        Returns:
+            np.ndarray: 複素数配列 (dtype=complex64 or complex128)
+        """
+        with self._lock:
+            if self.data_memmap is None:
+                raise RuntimeError("先にopen_data()を実行してください")
+
+            if end_sample is None:
+                end_sample = self.header['SAMPLES']
+
+            # 範囲チェック
+            start_sample = max(0, start_sample)
+            end_sample = min(self.header['SAMPLES'], end_sample)
+
+            if start_sample >= end_sample:
+                raise ValueError(f"無効な範囲: start={start_sample}, end={end_sample}")
+
+            format_type = self.header['FORMAT']
+            datatype = self.header['DATATYPE']
+
+            if format_type == 'complex':
+                # インターリーブされたI, Qデータを複素数に変換
+                start_idx = start_sample * 2
+                end_idx = end_sample * 2
+
+                # メモリマップからデータを読み込み
+                iq_interleaved = np.array(self.data_memmap[start_idx:end_idx])
+            else:
+                # real形式（未対応だが、念のため）
+                raise ValueError(f"未対応のフォーマット: {format_type}")
+
+        # ロック外で配列変換を実行（メモリマップへのアクセスは完了済み）
+        # I成分とQ成分に分離
+        i_data = iq_interleaved[0::2]
+        q_data = iq_interleaved[1::2]
+
+        # 複素数配列に変換
+        iq_complex = i_data + 1j * q_data
+
+        # 元の配列への参照を削除
+        del iq_interleaved, i_data, q_data
+
+        return iq_complex
+
+    def close(self):
+        """
+        メモリマップをクローズし、一時ディレクトリを削除
+        """
+        if self.data_memmap is not None:
+            try:
+                memmap_ref = self.data_memmap
+                self.data_memmap = None
+
+                if hasattr(memmap_ref, '_mmap') and memmap_ref._mmap is not None:
+                    try:
+                        memmap_ref._mmap.close()
+                    except:
+                        pass
+
+                del memmap_ref
+
+                import gc
+                gc.collect()
+
+            except Exception as e:
+                pass  # エラーは無視して続行
+
+        # 一時ディレクトリ削除
+        if self.temp_dir is not None and Path(self.temp_dir).exists():
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception as e:
+                pass  # 一時ディレクトリ削除エラーは無視
+        
+        # 内部状態リセット
+        self.header = {}
+        self.tar_path = None
+        self.temp_dir = None
+        self.data_file_path = None
+        self.xml_file_path = None
+
+
+class SpectrogramWidget(QWidget):
+    """
+    スペクトログラム表示ウィジェット
+
+    ROI（Region of Interest）選択機能付き。
+    大容量データに対応するため、表示範囲のみを計算する。
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.spectrogram_data = None
+        self.frequencies = None
+        self.times = None
+        self.roi_callback = None
+        self.current_min_level = None  # パーセンタイル調整用
+        self.current_max_level = None  # パーセンタイル調整用
+        self.current_sxx_db = None     # スペクトログラムデータ（dB）
+        self.init_ui()
+
+    def init_ui(self):
+        """UI初期化"""
+        layout = QVBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # PyQtGraphのGraphicsLayoutWidget使用
+        self.graphics_widget = pg.GraphicsLayoutWidget()
+
+        # プロットアイテム追加
+        self.plot_item = self.graphics_widget.addPlot()
+        self.plot_item.setLabel('left', '周波数 (MHz)')
+        self.plot_item.setLabel('bottom', '時間')
+        self.plot_item.showGrid(x=True, y=True, alpha=0.3)
+
+        # 画像アイテム
+        self.img_item = pg.ImageItem()
+        self.plot_item.addItem(self.img_item)
+
+        # カラーバー（ヒストグラムLUT）
+        self.hist = pg.HistogramLUTItem()
+        self.hist.setImageItem(self.img_item)
+
+        # デフォルトカラーマップ: plasma
+        self.set_colormap('plasma')
+
+        layout.addWidget(self.graphics_widget)
+        self.setLayout(layout)
+
+    def _auto_adjust_color_levels(self, sxx_db):
+        """
+        スペクトログラムデータの統計的解析に基づいて、カラーマップレベルを自動調整
+
+        信号を漏れなく抽出するため、以下の戦略を採用：
+        1. ダイナミックレンジ（DR）を計算
+        2. DRが広い → 強い信号あり → 下位パーセンタイルを高めに設定（ノイズカット）
+        3. DRが狭い → 微弱信号のみ → 下位パーセンタイルを低めに設定（信号保持）
+        4. 信号の分布形状（尖度）を考慮してパーセンタイルを微調整
+
+        Args:
+            sxx_db: スペクトログラムデータ（dB）
+
+        Returns:
+            tuple: (min_level, max_level)
+        """
+        # 基本統計量を計算
+        data_median = np.median(sxx_db)
+        data_mean = np.mean(sxx_db)
+        data_std = np.std(sxx_db)
+        data_min = np.min(sxx_db)
+        data_max = np.max(sxx_db)
+
+        # ダイナミックレンジ（DR）を計算
+        dynamic_range = data_max - data_median
+
+        # パーセンタイルを計算（99%のみ使用）
+        p99 = np.percentile(sxx_db, 99)
+
+        # 上位カットオフ: 99パーセンタイル値
+        upper_percentile_value = p99
+
+        # 下位カットオフ: 最大値から30dB下（ノイズフロアを適切に設定）
+        # 30dBは一般的な信号対雑音比（SNR）の目安
+        cutoff_db_from_max = 30.0  # 最大値から何dB下をカットオフにするか
+        lower_percentile_value = data_max - cutoff_db_from_max
+
+        # ただし、下位カットオフが最小値より小さくならないように制限
+        if lower_percentile_value < data_min:
+            lower_percentile_value = data_min
+
+        strategy = f"レベルベースカットオフ（最大値 -{cutoff_db_from_max}dB）"
+
+        # 最小限のレンジを確保（極端に狭いレンジを防ぐ）
+        min_range = 10  # 最低10dBのレンジを確保
+        if upper_percentile_value - lower_percentile_value < min_range:
+            # レンジが狭すぎる場合、中央値を基準に拡張
+            center = (upper_percentile_value + lower_percentile_value) / 2
+            lower_percentile_value = center - min_range / 2
+            upper_percentile_value = center + min_range / 2
+            strategy += " (最小レンジ拡張)"
+
+        print(f"[カラーマップ自動調整] {strategy}")
+        print(f"  DR: {dynamic_range:.1f} dB")
+        print(f"  表示範囲: {lower_percentile_value:.1f} ~ {upper_percentile_value:.1f} dB")
+        print(f"  データ範囲: {data_min:.1f} ~ {data_max:.1f} dB")
+        print(f"  カットオフレベル: 最大値({data_max:.1f}dB) - {cutoff_db_from_max}dB = {lower_percentile_value:.1f}dB")
+
+        return lower_percentile_value, upper_percentile_value
+
+    def _max_pool_2d(self, data, target_width, target_height):
+        """
+        2D最大値プーリング（ダウンサンプリング）
+
+        各ピクセルに対応する領域の最大値を取得することで、
+        信号のピークを保持したまま表示サイズに縮小。
+
+        Args:
+            data: 入力データ (height, width) = (周波数, 時間)
+            target_width: 目標幅（時間軸）
+            target_height: 目標高さ（周波数軸）
+
+        Returns:
+            np.ndarray: ダウンサンプリング後のデータ (target_height, target_width)
+        """
+        data_height, data_width = data.shape
+
+        # プーリングウィンドウサイズを計算
+        pool_height = max(1, data_height // target_height)
+        pool_width = max(1, data_width // target_width)
+
+        # 実際の出力サイズ（端数処理のため目標より小さくなる可能性あり）
+        out_height = data_height // pool_height
+        out_width = data_width // pool_width
+
+        # 出力配列を初期化
+        pooled = np.zeros((out_height, out_width), dtype=data.dtype)
+
+        # 各プールウィンドウごとに最大値を取得
+        for i in range(out_height):
+            for j in range(out_width):
+                h_start = i * pool_height
+                h_end = min((i + 1) * pool_height, data_height)
+                w_start = j * pool_width
+                w_end = min((j + 1) * pool_width, data_width)
+
+                # ウィンドウ内の最大値を取得
+                pooled[i, j] = np.max(data[h_start:h_end, w_start:w_end])
+
+        return pooled
+
+    def set_colormap(self, colormap_name):
+        """
+        カラーマップ設定
+
+        Args:
+            colormap_name: 'plasma', 'viridis', 'inferno', 'magma'
+        """
+        colormaps = {
+            'plasma': [
+                (0.0, (12, 7, 134, 255)),
+                (0.25, (126, 3, 167, 255)),
+                (0.5, (203, 71, 119, 255)),
+                (0.75, (248, 149, 64, 255)),
+                (1.0, (239, 248, 33, 255))
+            ],
+            'viridis': [
+                (0.0, (68, 1, 84, 255)),
+                (0.25, (59, 82, 139, 255)),
+                (0.5, (33, 145, 140, 255)),
+                (0.75, (94, 201, 98, 255)),
+                (1.0, (253, 231, 37, 255))
+            ],
+            'inferno': [
+                (0.0, (0, 0, 4, 255)),
+                (0.25, (87, 16, 110, 255)),
+                (0.5, (188, 55, 84, 255)),
+                (0.75, (249, 142, 9, 255)),
+                (1.0, (252, 255, 164, 255))
+            ],
+            'magma': [
+                (0.0, (0, 0, 4, 255)),
+                (0.25, (80, 18, 123, 255)),
+                (0.5, (182, 54, 121, 255)),
+                (0.75, (251, 136, 97, 255)),
+                (1.0, (252, 253, 191, 255))
+            ]
+        }
+
+        if colormap_name in colormaps:
+            self.hist.gradient.restoreState({
+                'mode': 'rgb',
+                'ticks': colormaps[colormap_name]
+            })
+
+    def update_spectrogram(self, frequencies, times, sxx_db, center_freq=0):
+        """
+        スペクトログラムを更新
+
+        Args:
+            frequencies: 周波数配列（Hz）
+            times: 時間配列（秒）
+            sxx_db: スペクトログラムデータ（dB）
+            center_freq: 中心周波数（Hz）
+        """
+        # 実周波数に変換
+        real_frequencies = frequencies + center_freq
+        freq_mhz = real_frequencies / 1e6
+
+        # 時間軸の単位選択
+        if times[-1] < 1e-6:
+            time_scale = times * 1e9
+            time_unit = 'ns'
+        elif times[-1] < 1e-3:
+            time_scale = times * 1e6
+            time_unit = 'μs'
+        elif times[-1] < 1:
+            time_scale = times * 1e3
+            time_unit = 'ms'
+        else:
+            time_scale = times
+            time_unit = 's'
+
+        # データ保存（後でROIアクセス用）
+        self.frequencies = freq_mhz
+        self.times = time_scale
+        self.time_unit = time_unit
+        self.spectrogram_data = sxx_db
+
+        # 表示用データを準備（最大値保持ダウンサンプリング）
+        # ウィジェットのサイズを取得して、必要に応じてダウンサンプリング
+        viewbox = self.plot_item.getViewBox()
+        viewbox_rect = viewbox.viewRect()
+
+        # ViewBoxのピクセルサイズを取得（スクリーン上の実際のサイズ）
+        widget_width = viewbox_rect.width()
+        widget_height = viewbox_rect.height()
+
+        # ピクセル数がデータポイント数より少ない場合のみダウンサンプリング
+        # ただし、幅と高さが妥当な範囲内（10〜10000ピクセル程度）の場合のみ
+        if widget_width and widget_height and 10 < widget_width < 10000 and 10 < widget_height < 10000:
+            target_width = int(widget_width)
+            target_height = int(widget_height)
+
+            # データサイズ
+            data_height, data_width = sxx_db.shape  # (周波数, 時間)
+
+            # ダウンサンプリングが必要か判定
+            need_downsample_width = data_width > target_width * 2
+            need_downsample_height = data_height > target_height * 2
+
+            if need_downsample_width or need_downsample_height:
+                print(f"[最大値プーリング] データ: {data_width}x{data_height} → 表示: {target_width}x{target_height}")
+                sxx_db_display = self._max_pool_2d(
+                    sxx_db,
+                    target_width if need_downsample_width else data_width,
+                    target_height if need_downsample_height else data_height
+                )
+            else:
+                sxx_db_display = sxx_db
+        else:
+            sxx_db_display = sxx_db
+
+        # 画像設定（転置して時間を横軸に）
+        self.img_item.setImage(sxx_db_display.T, autoLevels=False)
+
+        # 座標範囲設定
+        if len(time_scale) > 1 and len(freq_mhz) > 1:
+            rect = QRectF(
+                time_scale[0],
+                freq_mhz[0],
+                time_scale[-1] - time_scale[0],
+                freq_mhz[-1] - freq_mhz[0]
+            )
+            self.img_item.setRect(rect)
+
+        # 動的レベル調整（信号漏れ防止のための最適化）
+        # 信号のダイナミックレンジを自動解析して、微弱信号も見逃さない設定を適用
+        min_level, max_level = self._auto_adjust_color_levels(sxx_db)
+
+        self.hist.setLevels(min_level, max_level)
+        self.img_item.setLevels([min_level, max_level])
+
+        # パーセンタイル情報を保存（後で調整用）
+        self.current_min_level = min_level
+        self.current_max_level = max_level
+        self.current_sxx_db = sxx_db
+
+        # 軸ラベル更新
+        self.plot_item.setLabel('bottom', '時間', units=time_unit)
+
+        # 短いパルスの場合、時間軸の表示範囲を拡張して見やすくする
+        time_duration = time_scale[-1] - time_scale[0]
+        freq_range = freq_mhz[-1] - freq_mhz[0]
+
+        # 時間軸の最小表示幅を設定（周波数範囲の10%）
+        # これにより、短いパルスでも横方向に潰れない
+        min_time_width = freq_range * 0.1
+
+        if time_duration < min_time_width:
+            # パルスが短い場合、中心を保持しながら表示範囲を拡張
+            time_center = (time_scale[0] + time_scale[-1]) / 2
+            padding = (min_time_width - time_duration) / 2
+            time_min = time_center - min_time_width / 2
+            time_max = time_center + min_time_width / 2
+
+            # 周波数軸は全範囲表示
+            self.plot_item.setRange(
+                xRange=(time_min, time_max),
+                yRange=(freq_mhz[0], freq_mhz[-1]),
+                padding=0
+            )
+            print(f"[短パルス表示最適化] 時間幅 {time_duration:.3f} {time_unit} → 表示幅 {min_time_width:.3f} {time_unit}")
+        else:
+            # 通常の場合は全体表示
+            self.plot_item.autoRange()
+
+
+class RSIQViewer(QMainWindow):
+    """
+    Rohde & Schwarz IQデータビューワー メインウィンドウ
+
+    3つの表示エリア：
+    1. 最上段: Region範囲のスペクトログラム
+    2. 中段左: Region範囲の詳細波形（間引きなし）
+    3. 最下段: 全体波形（間引きあり）+ Region選択
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.wv_loader = None  # WVFileLoader or IQTarLoader
+        self.file_type = None  # 'wv' or 'iqtar'
+        self.total_samples = 0
+        self.sample_rate = 1.0
+        self.center_frequency = 0
+        self.region_start = 0
+        self.region_end = 100000
+
+        # 間引きパラメータ
+        self.decimation_threshold = 0.5  # 閾値以上の信号は間引かない（将来の拡張用）
+
+        # 自動更新フラグ
+        self.auto_update_spectrogram = False  # スペクトログラム自動更新
+
+        # イベント管理の統合
+        # これらのフラグを使って複雑なイベントチェーンを防止
+        self._event_state = {
+            'spectrogram_calculating': False,    # スペクトログラム計算中
+            'region_updating': False,            # Region更新中
+            'viewbox_updating': False,           # ViewBox更新中
+            'programmatic_update': False,        # プログラム制御中
+            'closing': False                      # 終了処理中
+        }
+
+        # 後方互換性のための旧フラグエイリアス
+        self._spectrogram_calculating = False
+        self.is_closing = False
+
+
+        # プラットフォーム別フォントサイズ設定
+        if sys.platform == 'win32':
+            # Windows: 9ptに統一（コンパクト表示）
+            self.font_size_large = 9
+            self.font_size_small = 9
+            # Windows: UI要素の高さ設定
+            self.button_height = 35          # ボタン高さ
+            self.control_panel_height = 45   # コントロールパネル高さ
+            # 標準出力: 10行分の高さ（行間1.5倍を考慮）
+            self.stdout_lines = 10
+            self.stdout_min_height = int(self.font_size_large * 1.5 * self.stdout_lines)
+            self.stdout_max_height = int(self.font_size_large * 1.5 * self.stdout_lines)
+        else:
+            # macOS/Linux: 大きめのフォント
+            self.font_size_large = 20
+            self.font_size_small = 16
+            # macOS/Linux: UI要素の高さ設定
+            self.button_height = 50
+            self.control_panel_height = 60
+            # 標準出力: 10行分の高さ（行間1.5倍を考慮）
+            self.stdout_lines = 10
+            self.stdout_min_height = int(self.font_size_large * 1.5 * self.stdout_lines)
+            self.stdout_max_height = int(self.font_size_large * 1.5 * self.stdout_lines)
+
+        self.init_ui()
+
+    def init_ui(self):
+        """UI初期化"""
+        self.setWindowTitle("Rohde & Schwarz IQデータビューワー - [左側でファイル選択 | Ctrl+S: 保存 | Ctrl+Q: 終了]")
+
+        # スクリーンサイズに応じてウィンドウサイズ調整
+        screen = QApplication.primaryScreen()
+        screen_geometry = screen.availableGeometry()
+
+        # 高さを画面いっぱい（95%）に設定し、アスペクト比を維持して横幅を計算
+        # 元のアスペクト比: 1200:900 = 4:3
+        aspect_ratio = 4.0 / 3.0
+
+        # 高さを画面の95%に設定（タスクバー等を考慮）
+        target_height = int(screen_geometry.height() * 0.95)
+
+        # アスペクト比を維持して横幅を計算
+        target_width = int(target_height * aspect_ratio / 1.333)  # 1.333 = 4/3の逆数
+
+        # プラットフォームに応じた調整
+        if sys.platform == 'win32':
+            # Windows: DPIスケーリング対応
+            dpi = screen.logicalDotsPerInch()
+            scale_factor = dpi / 96.0
+            if scale_factor > 1.0:
+                # 高DPI環境では若干縮小
+                target_width = int(target_width / scale_factor * 0.9)
+                target_height = int(target_height / scale_factor * 0.9)
+
+        # 画面幅を超えないように制限
+        max_width = int(screen_geometry.width() * 0.85)
+        if target_width > max_width:
+            target_width = max_width
+            # 幅が制限された場合、高さもアスペクト比に合わせて調整
+            target_height = int(target_width * 1.333)
+
+        # ウィンドウ位置を画面中央に配置
+        x_pos = (screen_geometry.width() - target_width) // 2
+        y_pos = (screen_geometry.height() - target_height) // 2
+
+        self.setGeometry(x_pos, y_pos, target_width, target_height)
+
+        # 中央ウィジェット
+        central = QWidget()
+        self.setCentralWidget(central)
+        main_layout = QVBoxLayout(central)
+
+        # === コントロールパネル ===
+        control_group = self.create_control_panel()
+        main_layout.addWidget(control_group)
+
+        # === メインエリア（水平分割：ファイルブラウザ | プロット表示） ===
+        main_splitter = QSplitter(Qt.Horizontal)
+
+        # === 左側：ファイルブラウザ ===
+        browser_widget = self.create_file_browser()
+        main_splitter.addWidget(browser_widget)
+
+        # === 右側：プロット表示エリア（垂直分割） ===
+        plot_container = QWidget()
+        plot_layout = QVBoxLayout(plot_container)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 上段: スペクトログラム表示のみ
+        self.spectrogram_widget = SpectrogramWidget()
+
+        # 中段: Region範囲の時間-振幅波形（スペクトログラムと横軸連動）
+        self.region_plot = pg.PlotWidget()
+        self.region_plot.setLabel('left', '振幅')
+        self.region_plot.setLabel('bottom', '時間', units='s')
+        self.region_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.region_plot.setTitle("Region範囲 時間-振幅波形")
+        self.region_plot.setMinimumHeight(150)  # 最小高さ150px（マウス拡大で潰れないように）
+        self.region_curve = self.region_plot.plot(pen=pg.mkPen('c', width=1))
+
+        # スペクトログラムと横軸を連動（X軸同期、Y軸は自動調整）
+        self.region_plot.setXLink(self.spectrogram_widget.plot_item)
+        region_viewbox = self.region_plot.getViewBox()
+        region_viewbox.enableAutoRange(axis='y', enable=True)
+
+        # Y軸の移動・拡大縮小を無効化（ユーザー要望）
+        region_viewbox.setMouseEnabled(x=True, y=False)  # X軸のみマウス操作可能
+
+        # Region plotのViewBox範囲変更時に波形を再計算（デバウンス付き）
+        self.region_viewbox = region_viewbox  # ViewBoxの参照を保存（シグナル切断用）
+        self.region_update_timer = QTimer()
+        self.region_update_timer.setSingleShot(True)
+        self.region_update_timer.timeout.connect(self.on_region_viewbox_changed)
+        self.region_update_delay = 500  # 500ms待機
+
+        # ViewBoxトラッキング用のラムダ関数を保存（切断/再接続に使用）
+        self._region_viewbox_handler = lambda: self.region_update_timer.start(self.region_update_delay)
+        region_viewbox.sigRangeChanged.connect(self._region_viewbox_handler)
+
+        # 下段: フルスパン波形表示（全幅）
+        self.overview_plot = pg.PlotWidget()
+        self.overview_plot.setLabel('left', '振幅')
+        self.overview_plot.setLabel('bottom', '時間', units='s')
+        self.overview_plot.showGrid(x=True, y=True, alpha=0.3)
+        self.overview_plot.setTitle("全データ波形（Min-Maxダウンサンプリング / Region選択）")
+        self.overview_curve = self.overview_plot.plot(pen=pg.mkPen('y', width=1))
+
+        # ViewBox範囲変更時の再計算設定
+        self.overview_viewbox = self.overview_plot.getViewBox()
+
+        # Y軸の操作を無効化（X軸のみズーム/パン可能）
+        self.overview_viewbox.setMouseEnabled(x=True, y=False)
+
+        # Y軸の自動スケーリングを有効化（常に全データが見える）
+        self.overview_viewbox.enableAutoRange(axis='y', enable=True)
+        self.overview_viewbox.setAutoVisible(y=True)
+
+        # プログラム制御フラグ（プログラムからのViewBox変更を識別）
+        self._programmatic_overview_update = False
+
+        # 処理ロックフラグ（連続したViewBox変更の並行実行を防止）
+        self._overview_processing = False
+
+        # ViewBox変更イベントを直接接続（フラグで制御）
+        self.overview_viewbox.sigRangeChanged.connect(self.on_overview_range_changed)
+
+        # Region選択
+        self.region = pg.LinearRegionItem(
+            values=(0, 100000),
+            brush=(100, 100, 255, 30),
+            pen=pg.mkPen('b', width=2)
+        )
+        # Region変更中はRegion波形のみ更新（軽量）
+        self.region.sigRegionChanged.connect(self.on_region_changed)
+        # Region変更完了後にスペクトログラムを更新（重量級処理）
+        self.region.sigRegionChangeFinished.connect(self.on_region_change_finished)
+        self.overview_plot.addItem(self.region)
+
+        # コンテキストメニューの設定（元のメニューは維持）
+        self.overview_plot.scene().sigMouseClicked.connect(self.on_overview_mouse_clicked)
+
+        # スプリッターで3段に配置
+        splitter = QSplitter(Qt.Vertical)
+        splitter.addWidget(self.spectrogram_widget)
+        splitter.addWidget(self.region_plot)
+        splitter.addWidget(self.overview_plot)
+
+        # スプリッターのサイズ比率設定
+        # スペクトログラム:Region波形:全体波形 = 3:2:1
+        splitter.setSizes([600, 400, 200])
+
+        plot_layout.addWidget(splitter)
+        main_splitter.addWidget(plot_container)
+
+        # メインスプリッターのサイズ比率設定
+        # ファイルブラウザ:プロット表示 = 1:8 (幅を半分に)
+        main_splitter.setSizes([150, 1200])
+
+        # メインスプリッターをストレッチファクター1で追加（可変高さ）
+        main_layout.addWidget(main_splitter, 1)
+
+        # === 標準出力 + 調整パネル（横並び） ===
+        bottom_container = QWidget()
+        bottom_layout = QHBoxLayout(bottom_container)
+        bottom_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 左側: 標準出力表示エリア
+        stdout_group = QGroupBox("標準出力")
+        stdout_layout = QVBoxLayout()
+
+        self.stdout_text = QTextEdit()
+        self.stdout_text.setReadOnly(True)
+        self.stdout_text.setMinimumHeight(self.stdout_min_height)
+        self.stdout_text.setMaximumHeight(self.stdout_max_height)
+        # 垂直方向のサイズポリシー: 固定
+        self.stdout_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.stdout_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                font-family: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: {self.font_size_large}pt;
+                border: 1px solid #3e3e3e;
+                line-height: 1.3;
+            }}
+        """)
+        self.stdout_text.setPlaceholderText("標準出力がここに表示されます...")
+
+        stdout_layout.addWidget(self.stdout_text)
+        stdout_group.setLayout(stdout_layout)
+        bottom_layout.addWidget(stdout_group, 3)  # 幅の比率3
+
+        # 右側: 調整パネル
+        adjust_group = self.create_adjustment_panel()
+        bottom_layout.addWidget(adjust_group, 1)  # 幅の比率1
+
+        # 標準出力+調整パネルをストレッチファクター0で追加（固定高さ）
+        main_layout.addWidget(bottom_container, 0)
+
+        # 標準出力リダイレクト設定
+        self.stdout_redirector = StdoutRedirector(sys.stdout)
+        self.stdout_redirector.text_written.connect(self.append_stdout)
+        sys.stdout = self.stdout_redirector
+
+        # ステータスバー（水平レイアウト）
+        status_container = QWidget()
+        status_layout = QHBoxLayout()
+        status_layout.setContentsMargins(5, 5, 5, 5)
+        status_container.setLayout(status_layout)
+
+        # 左側：ステータスメッセージ
+        self.status_label = QLabel("左側のファイルブラウザからファイルを選択してください")
+        self.status_label.setStyleSheet(f"font-size: {self.font_size_large}pt; padding: 5px;")
+        status_layout.addWidget(self.status_label, 1)  # ストレッチファクター1で伸縮
+
+        # 右側：メモリ使用量表示
+        self.memory_label = QLabel("メモリ: -- / -- GB")
+        self.memory_label.setStyleSheet(f"font-size: {self.font_size_large}pt; padding: 5px; color: #888888;")
+        self.memory_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        status_layout.addWidget(self.memory_label, 0)  # ストレッチファクター0で固定幅
+
+        main_layout.addWidget(status_container)
+
+        # メモリ更新タイマー（2秒ごと）
+        self.memory_timer = QTimer()
+        self.memory_timer.timeout.connect(self.update_memory_info)
+        self.memory_timer.start(2000)  # 2秒間隔
+        self.update_memory_info()  # 初回更新
+
+        # キーボードショートカットの設定
+        self.setup_shortcuts()
+
+    def create_file_browser(self):
+        """ファイルブラウザ作成（ディレクトリ + ファイルを統合表示）"""
+        browser_group = QGroupBox("ファイルブラウザ")
+        browser_layout = QVBoxLayout()
+
+        # カレントディレクトリ表示
+        current_dir = Path.cwd()
+        dir_label = QLabel(f"📁 起動ディレクトリ: {current_dir.name}")
+        dir_label.setStyleSheet("font-weight: bold; padding: 5px;")
+        dir_label.setToolTip(str(current_dir))
+        browser_layout.addWidget(dir_label)
+
+        # ファイルシステムモデル（ディレクトリとファイルを両方表示）
+        self.file_model = QFileSystemModel()
+        self.file_model.setRootPath(str(current_dir))
+
+        # ファイルフィルタ設定（ディレクトリ + .wvh + .iq.tar）
+        self.file_model.setNameFilters(["*.wvh", "*.iq.tar"])
+        self.file_model.setNameFilterDisables(False)  # フィルタに一致しないファイルを非表示
+
+        # ディレクトリも表示（"."と".."は非表示、パンくずリストで親ディレクトリへ移動）
+        self.file_model.setFilter(QDir.AllDirs | QDir.Files | QDir.NoDot | QDir.NoDotDot)
+
+        # ツリービュー
+        self.file_tree = QTreeView()
+        self.file_tree.setModel(self.file_model)
+
+        # ソート設定：ディレクトリを先に
+        self.file_tree.setSortingEnabled(True)
+        self.file_model.sort(0, Qt.AscendingOrder)
+
+        # 初期表示はカレントディレクトリのみ（パンくずリストで上位に移動可能）
+        self.current_root_dir = current_dir
+        self.file_tree.setRootIndex(self.file_model.index(str(current_dir)))
+
+        # 列の設定（名前、サイズのみ表示）
+        self.file_tree.setColumnWidth(0, 250)  # 名前
+        self.file_tree.setColumnHidden(2, True)  # Type
+        self.file_tree.setColumnHidden(3, True)  # Date Modified
+
+        # フォントサイズ設定
+        self.file_tree.setStyleSheet(f"""
+            QTreeView {{
+                font-size: {self.font_size_large}pt;
+            }}
+        """)
+
+        # シングルクリックでヘッダー情報表示
+        self.file_tree.clicked.connect(self.on_file_tree_clicked)
+
+        # ダブルクリックで開く
+        self.file_tree.doubleClicked.connect(self.on_file_tree_double_clicked)
+
+        browser_layout.addWidget(self.file_tree)
+
+        # ヘッダー情報表示エリア
+        header_label = QLabel("ファイル情報:")
+        header_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        browser_layout.addWidget(header_label)
+
+        self.header_info_text = QTextEdit()
+        self.header_info_text.setReadOnly(True)
+        self.header_info_text.setMinimumHeight(300)  # 最小高さを2倍に
+        self.header_info_text.setStyleSheet(f"""
+            QTextEdit {{
+                background-color: #f5f5f5;
+                color: #333333;
+                font-family: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
+                font-size: {self.font_size_small}pt;
+                border: 1px solid #cccccc;
+                padding: 8px;
+                line-height: 1.0;
+            }}
+        """)
+        self.header_info_text.setPlaceholderText("ファイルを選択するとヘッダー情報が表示されます...")
+        browser_layout.addWidget(self.header_info_text)
+
+        browser_group.setLayout(browser_layout)
+        return browser_group
+
+    def update_breadcrumb(self, current_path):
+        """パンくずリスト（絶対パス）を更新"""
+        # 既存のウィジェットをクリア
+        while self.breadcrumb_layout.count():
+            child = self.breadcrumb_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        # パスを分解
+        path_parts = []
+        temp_path = Path(current_path)
+
+        # ルートまで遡る
+        while True:
+            path_parts.insert(0, temp_path)
+            if temp_path.parent == temp_path:  # ルートに到達
+                break
+            temp_path = temp_path.parent
+
+        # 各階層をボタンとして追加
+        for i, path_part in enumerate(path_parts):
+            # ボタン作成
+            if i == 0:
+                # ルートディレクトリ
+                if sys.platform == 'win32':
+                    # Windows: ドライブ文字 (C:, D:, など)
+                    btn_text = str(path_part)
+                else:
+                    # macOS/Linux: /
+                    btn_text = "/"
+            else:
+                btn_text = path_part.name
+
+            btn = QPushButton(btn_text)
+            btn.setFlat(True)
+            btn.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: transparent;
+                    border: none;
+                    color: #0066cc;
+                    text-align: left;
+                    padding: 2px 5px;
+                    font-size: {self.font_size_large}pt;
+                }}
+                QPushButton:hover {{
+                    background-color: #e6f2ff;
+                    text-decoration: underline;
+                }}
+            """)
+
+            # クリック時に該当パスに移動
+            path_to_move = str(path_part)
+            btn.clicked.connect(lambda checked, p=path_to_move: self.navigate_to_path(p))
+
+            self.breadcrumb_layout.addWidget(btn)
+
+            # 最後以外は区切り文字を追加
+            if i < len(path_parts) - 1:
+                separator = QLabel("/")
+                separator.setStyleSheet(f"color: #888888; font-size: {self.font_size_large}pt;")
+                self.breadcrumb_layout.addWidget(separator)
+
+    def navigate_to_path(self, path_str):
+        """指定されたパスに移動"""
+        target_path = Path(path_str)
+        if target_path.exists() and target_path.is_dir():
+            self.current_root_dir = target_path
+            self.file_tree.setRootIndex(self.file_model.index(str(target_path)))
+            self.update_breadcrumb(target_path)
+            self.status_label.setText(f"📁 {target_path}")
+
+    def on_file_tree_clicked(self, index):
+        """ツリービューでクリック時の処理（ヘッダー情報表示）"""
+        file_path = Path(self.file_model.filePath(index))
+
+        # ディレクトリの場合は何もしない
+        if file_path.is_dir():
+            self.header_info_text.clear()
+            self.header_info_text.setPlaceholderText("ディレクトリが選択されています...")
+            return
+
+        # ファイルの場合はヘッダー情報を表示
+        if file_path.suffix in ['.wvh', '.tar'] or str(file_path).endswith('.iq.tar'):
+            self.display_file_header(file_path)
+
+    def display_file_header(self, file_path):
+        """ファイルのヘッダー情報を整形して表示"""
+        try:
+            # ファイル名の表示幅を計算（絵文字 + スペース + ファイル名）
+            # 絵文字は2文字幅、ASCIIは1文字幅、日本語等は2文字幅として計算
+            display_name = f"📄 {file_path.name}"
+            display_width = 0
+            for char in display_name:
+                # ord(char) > 127 は非ASCII文字（日本語、絵文字等）
+                # 簡易的に、非ASCII文字は2幅、ASCII文字は1幅
+                if ord(char) > 127:
+                    display_width += 2
+                else:
+                    display_width += 1
+
+            header_text = f"{display_name}\n"
+            header_text += "=" * display_width + "\n\n"
+
+            if file_path.suffix == '.wvh':
+                # WVHファイルのヘッダー読み込み
+                temp_loader = WVFileLoader()
+                header = temp_loader.parse_wvh(str(file_path))
+
+                # ファイルサイズ
+                wvd_path = file_path.with_suffix('.wvd')
+                if wvd_path.exists():
+                    size_gb = wvd_path.stat().st_size / 1e9
+                    header_text += f"WVDサイズ:        {size_gb:.2f} GB\n"
+
+                # 基本情報
+                header_text += f"フォーマット:     {header.get('TYPE', 'N/A')}\n"
+                header_text += f"コンポーネント:   {header.get('COMPONENTS', 'N/A')}\n"
+                header_text += f"分解能:           {header.get('RESOLUTION', 'N/A')} bit\n\n"
+
+                # サンプリング情報
+                samples = header.get('SAMPLES', 0)
+                clock = header.get('CLOCK', 0)
+                header_text += f"サンプル数:       {samples:,}\n"
+                header_text += f"サンプリング周波数: {clock/1e6:.2f} MHz\n"
+
+                # 継続時間計算
+                if clock > 0:
+                    duration_sec = samples / clock
+                    if duration_sec < 1e-3:
+                        duration_str = f"{duration_sec*1e6:.2f} μs"
+                    elif duration_sec < 1:
+                        duration_str = f"{duration_sec*1e3:.2f} ms"
+                    else:
+                        duration_str = f"{duration_sec:.3f} s"
+                    header_text += f"継続時間:         {duration_str}\n\n"
+
+                # 周波数情報
+                frequency = header.get('FREQUENCY', 0)
+                header_text += f"中心周波数:       {frequency/1e6:.2f} MHz\n"
+                if clock > 0:
+                    bandwidth = clock
+                    header_text += f"瞬時帯域幅:       {bandwidth/1e6:.2f} MHz\n"
+                    header_text += f"周波数範囲:       {(frequency-bandwidth/2)/1e6:.2f} - {(frequency+bandwidth/2)/1e6:.2f} MHz\n\n"
+
+                # その他の情報
+                if 'DATE' in header:
+                    header_text += f"日付:             {header['DATE']}\n"
+                if 'FWVERSION' in header:
+                    header_text += f"ファームウェア:   {header['FWVERSION']}\n"
+                if 'CHANNAME0' in header:
+                    header_text += f"チャンネル名:     {header['CHANNAME0']}\n"
+
+            elif str(file_path).endswith('.iq.tar'):
+                # iq.tarファイルのヘッダー読み込み
+                temp_loader = IQTarLoader()
+                header = temp_loader.parse_iqtar(str(file_path))
+
+                # ファイルサイズ
+                size_gb = file_path.stat().st_size / 1e9
+                header_text += f"ファイルサイズ:   {size_gb:.2f} GB\n\n"
+
+                # 基本情報
+                header_text += f"フォーマット:     iq.tar (float32)\n"
+                header_text += f"コンポーネント:   IQ\n\n"
+
+                # サンプリング情報
+                samples = header.get('SAMPLES', 0)
+                clock = header.get('CLOCK', 0)
+                header_text += f"サンプル数:       {samples:,}\n"
+                header_text += f"サンプリング周波数: {clock/1e6:.2f} MHz\n"
+
+                # 継続時間計算
+                if clock > 0:
+                    duration_sec = samples / clock
+                    if duration_sec < 1e-3:
+                        duration_str = f"{duration_sec*1e6:.2f} μs"
+                    elif duration_sec < 1:
+                        duration_str = f"{duration_sec*1e3:.2f} ms"
+                    else:
+                        duration_str = f"{duration_sec:.3f} s"
+                    header_text += f"継続時間:         {duration_str}\n\n"
+
+                # 周波数情報
+                frequency = header.get('FREQUENCY', 0)
+                header_text += f"中心周波数:       {frequency/1e6:.2f} MHz\n"
+                if clock > 0:
+                    bandwidth = clock
+                    header_text += f"瞬時帯域幅:       {bandwidth/1e6:.2f} MHz\n"
+                    header_text += f"周波数範囲:       {(frequency-bandwidth/2)/1e6:.2f} - {(frequency+bandwidth/2)/1e6:.2f} MHz\n"
+
+                # 一時ディレクトリをクリーンアップ
+                temp_loader.close()
+
+            self.header_info_text.setPlainText(header_text)
+
+        except Exception as e:
+            error_text = f"❌ ヘッダー読み込みエラー\n\n"
+            error_text += f"ファイル: {file_path.name}\n"
+            error_text += f"エラー: {str(e)}"
+            self.header_info_text.setPlainText(error_text)
+
+    def on_file_tree_double_clicked(self, index):
+        """
+        ツリービューでダブルクリック時の処理
+
+        注: ".."はQDir.NoDotDotで非表示にしているため、
+        親ディレクトリへの移動はパンくずリストから行う。
+        """
+        file_path = Path(self.file_model.filePath(index))
+
+        # サブディレクトリの場合は、そのディレクトリをルートにする
+        if file_path.is_dir():
+            self.current_root_dir = file_path
+            self.file_tree.setRootIndex(self.file_model.index(str(file_path)))
+            self.update_breadcrumb(file_path)
+            self.status_label.setText(f"📁 {file_path}")
+            return
+
+        # ファイルの場合は読み込み
+        if file_path.suffix in ['.wvh', '.tar'] or str(file_path).endswith('.iq.tar'):
+            # ファイルの親ディレクトリに移動してパンくずリストを更新
+            parent_dir = file_path.parent
+            self.current_root_dir = parent_dir
+            self.file_tree.setRootIndex(self.file_model.index(str(parent_dir)))
+            self.update_breadcrumb(parent_dir)
+
+            self.status_label.setText(f"📄 読み込み中: {file_path.name}")
+            self.load_file(str(file_path))
+
+    def create_control_panel(self):
+        """コントロールパネル作成"""
+        # グループボックスなしで直接レイアウト
+        container = QWidget()
+        layout = QHBoxLayout()
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        # パンくずリスト（左寄せ・コンパクト表示）
+        breadcrumb_container = QWidget()
+        breadcrumb_layout = QHBoxLayout(breadcrumb_container)
+        breadcrumb_layout.setContentsMargins(0, 5, 0, 5)
+        breadcrumb_layout.setSpacing(0)
+        breadcrumb_layout.setAlignment(Qt.AlignLeft)  # 左寄せ
+
+        self.breadcrumb_layout = breadcrumb_layout
+
+        # 初期パンくずリストを設定（ファイル読み込み時に更新）
+        current_dir = Path.cwd()
+        self.current_root_dir = current_dir
+        self.update_breadcrumb(current_dir)
+
+        # パンくずリストを左寄せでコンパクトに配置（ストレッチなし）
+        layout.addWidget(breadcrumb_container, 0)
+
+        # スペーサー（ボタンを右端に固定）
+        layout.addStretch()
+
+        # スペクトログラム計算ボタン
+        self.calc_spec_btn = QPushButton("📊 スペクトログラム計算")
+        self.calc_spec_btn.clicked.connect(self.calculate_spectrogram)
+        self.calc_spec_btn.setEnabled(False)
+        self.calc_spec_btn.setToolTip("選択したRegion範囲のスペクトログラムを手動計算\n自動更新がOFFの場合に使用")
+        self.calc_spec_btn.setFixedHeight(self.button_height)
+        self.calc_spec_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #4CAF50;
+                color: white;
+                font-weight: bold;
+                font-size: {self.font_size_large}pt;
+                padding: 5px 15px;
+            }}
+            QPushButton:hover {{
+                background-color: #45A049;
+            }}
+            QPushButton:disabled {{
+                background-color: #cccccc;
+                color: #666666;
+            }}
+        """)
+        layout.addWidget(self.calc_spec_btn)
+
+        # Saveボタン
+        self.save_btn = QPushButton("💾 保存")
+        self.save_btn.clicked.connect(self.save_region)
+        self.save_btn.setEnabled(False)
+        self.save_btn.setToolTip("選択したRegion範囲をWVH/WVD形式で保存")
+        self.save_btn.setFixedHeight(self.button_height)
+        self.save_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #00BCD4;
+                color: white;
+                font-weight: bold;
+                font-size: {self.font_size_large}pt;
+                padding: 5px 15px;
+            }}
+            QPushButton:hover {{
+                background-color: #0097A7;
+            }}
+            QPushButton:disabled {{
+                background-color: #cccccc;
+                color: #666666;
+            }}
+        """)
+        layout.addWidget(self.save_btn)
+
+        # 終了ボタン
+        self.exit_btn = QPushButton("🚪 終了")
+        self.exit_btn.clicked.connect(self.safe_exit)
+        self.exit_btn.setToolTip("アプリケーションを終了 (Ctrl+Q / Cmd+Q)")
+        self.exit_btn.setFixedHeight(self.button_height)
+        self.exit_btn.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #f44336;
+                color: white;
+                font-weight: bold;
+                font-size: {self.font_size_large}pt;
+                padding: 5px 15px;
+            }}
+            QPushButton:hover {{
+                background-color: #d32f2f;
+            }}
+        """)
+        layout.addWidget(self.exit_btn)
+
+        container.setLayout(layout)
+        container.setMaximumHeight(self.control_panel_height)
+        return container
+
+    def setup_shortcuts(self):
+        """
+        キーボードショートカットの設定
+
+        - Ctrl+S / Cmd+S: Region範囲を保存
+        - Ctrl+Q / Cmd+Q: 終了（確認なし）
+        """
+        # 保存 (Ctrl+S / Cmd+S)
+        shortcut_save = QShortcut(QKeySequence.StandardKey.Save, self)
+        shortcut_save.activated.connect(self.save_region)
+
+        # 終了 (Ctrl+Q / Cmd+Q)
+        shortcut_quit = QShortcut(QKeySequence.StandardKey.Quit, self)
+        shortcut_quit.activated.connect(self.safe_exit)
+
+    def create_adjustment_panel(self):
+        """調整パネル作成"""
+        group = QGroupBox("表示調整")
+        layout = QVBoxLayout()
+
+        # 自動更新チェックボックス
+        self.auto_update_checkbox = QCheckBox("Region変更時に自動更新")
+        self.auto_update_checkbox.setChecked(False)
+        self.auto_update_checkbox.setToolTip("ONにするとRegion範囲変更時にスペクトログラムも自動計算")
+        self.auto_update_checkbox.stateChanged.connect(self.on_auto_update_changed)
+        layout.addWidget(self.auto_update_checkbox)
+
+        # 区切り線
+        from PySide6.QtWidgets import QFrame
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line)
+
+        # カラーマップ選択
+        color_layout = QHBoxLayout()
+        color_layout.addWidget(QLabel("カラーマップ:"))
+        self.colormap_combo = QComboBox()
+        self.colormap_combo.addItems(['plasma', 'viridis', 'inferno', 'magma'])
+        self.colormap_combo.currentTextChanged.connect(self.on_colormap_changed)
+        color_layout.addWidget(self.colormap_combo)
+        layout.addLayout(color_layout)
+
+        # NFFT設定
+        nfft_layout = QHBoxLayout()
+        nfft_layout.addWidget(QLabel("NFFT:"))
+        self.nfft_spin = QSpinBox()
+        self.nfft_spin.setRange(64, 8192)
+        self.nfft_spin.setSingleStep(64)
+        self.nfft_spin.setValue(256)
+        self.nfft_spin.setToolTip("スペクトログラムのFFTサイズ")
+        nfft_layout.addWidget(self.nfft_spin)
+        layout.addLayout(nfft_layout)
+
+        # オーバーラップ
+        overlap_layout = QHBoxLayout()
+        overlap_layout.addWidget(QLabel("オーバーラップ:"))
+        self.overlap_spin = QSpinBox()
+        self.overlap_spin.setRange(0, 90)
+        self.overlap_spin.setSingleStep(10)
+        self.overlap_spin.setValue(50)
+        self.overlap_spin.setSuffix("%")
+        self.overlap_spin.setToolTip("スペクトログラムのオーバーラップ率")
+        overlap_layout.addWidget(self.overlap_spin)
+        layout.addLayout(overlap_layout)
+
+        # 区切り線
+        line2 = QFrame()
+        line2.setFrameShape(QFrame.HLine)
+        line2.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(line2)
+
+        # 下位カットオフ調整（ノイズフロア除去）
+        cutoff_label = QLabel("下位カットオフ:")
+        cutoff_label.setToolTip("ノイズフロアをカットして小信号を強調\n大きい値でノイズを除去")
+        layout.addWidget(cutoff_label)
+
+        cutoff_layout = QHBoxLayout()
+        self.lower_cutoff_spin = QSpinBox()
+        self.lower_cutoff_spin.setRange(0, 50)
+        self.lower_cutoff_spin.setSingleStep(1)
+        self.lower_cutoff_spin.setValue(0)  # デフォルト: 0%（カットなし）
+        self.lower_cutoff_spin.setSuffix(" %")
+        self.lower_cutoff_spin.setToolTip("下位何%をカットするか\n0% = カットなし（全表示）\n1% = 軽度のノイズ除去\n3-5% = 中程度のノイズ除去\n10%以上 = 強力なノイズ除去")
+        self.lower_cutoff_spin.valueChanged.connect(self.on_cutoff_changed)
+        cutoff_layout.addWidget(self.lower_cutoff_spin)
+        layout.addLayout(cutoff_layout)
+
+        layout.addStretch()
+
+        group.setLayout(layout)
+        return group
+
+    def cleanup_previous_data(self):
+        """
+        既存データのクリーンアップ
+
+        別のファイルを開く前に、現在開いているファイルの
+        メモリマップやプロットデータを完全に解放する。
+        これにより、大容量ファイルを連続して開いてもメモリエラーを防ぐ。
+        """
+        try:
+            print("既存データのクリーンアップ開始...")
+
+            # ========================================
+            # 1. プロットデータをクリア
+            # ========================================
+            if hasattr(self, 'overview_curve') and self.overview_curve is not None:
+                try:
+                    self.overview_curve.setData([], [])
+                except:
+                    pass
+
+            # 下段Overview波形プロットをリセット（Regionは保持）
+            if hasattr(self, 'overview_plot') and self.overview_plot is not None:
+                try:
+                    # カーブのみクリア（overview_curveを削除してから再作成）
+                    if hasattr(self, 'overview_curve') and self.overview_curve is not None:
+                        self.overview_plot.removeItem(self.overview_curve)
+                    # 軸ラベルをリセット
+                    self.overview_plot.setLabel('bottom', '時間', units='s')
+                    self.overview_plot.setLabel('left', '振幅')
+                    # プロットカーブを再作成
+                    self.overview_curve = self.overview_plot.plot(pen=pg.mkPen('y', width=1))
+
+                    # Regionを再作成（clear()で削除されるため）
+                    if hasattr(self, 'region') and self.region is not None:
+                        try:
+                            self.overview_plot.removeItem(self.region)
+                        except:
+                            pass
+                    # 新しいRegionを作成（初期位置は後で設定）
+                    self.region = pg.LinearRegionItem(values=(0, 1), movable=True)
+                    self.region.sigRegionChanged.connect(self.on_region_changed)
+                    self.region.sigRegionChangeFinished.connect(self.on_region_change_finished)
+                    self.overview_plot.addItem(self.region)
+                except:
+                    pass
+
+            if hasattr(self, 'region_curve') and self.region_curve is not None:
+                try:
+                    self.region_curve.setData([], [])
+                except:
+                    pass
+
+            # 中段Region波形プロットをリセット
+            if hasattr(self, 'region_plot') and self.region_plot is not None:
+                try:
+                    # カーブのみクリア
+                    if hasattr(self, 'region_curve') and self.region_curve is not None:
+                        self.region_plot.removeItem(self.region_curve)
+                    # 軸ラベルをリセット
+                    self.region_plot.setLabel('bottom', '時間', units='s')
+                    self.region_plot.setLabel('left', '振幅')
+                    # プロットカーブを再作成
+                    self.region_curve = self.region_plot.plot(pen=pg.mkPen('c', width=1))
+                except:
+                    pass
+
+            if hasattr(self, 'spectrogram_widget') and self.spectrogram_widget is not None:
+                # スペクトログラムデータを完全削除
+                self.spectrogram_widget.spectrogram_data = None
+                self.spectrogram_widget.frequencies = None
+                self.spectrogram_widget.times = None
+                self.spectrogram_widget.time_unit = None
+                # ImageItemのデータのみクリア（ウィジェット自体は削除しない）
+                if hasattr(self.spectrogram_widget, 'img_item') and self.spectrogram_widget.img_item is not None:
+                    try:
+                        # 空のデータでImageを更新（ImageItem自体は保持）
+                        import numpy as np
+                        empty_data = np.zeros((1, 1))
+                        self.spectrogram_widget.img_item.setImage(empty_data)
+                    except:
+                        pass
+                # 軸ラベルをリセット
+                try:
+                    self.spectrogram_widget.plot_item.setLabel('bottom', '時間')
+                    self.spectrogram_widget.plot_item.setLabel('left', '周波数', units='MHz')
+                except:
+                    pass
+
+            # ========================================
+            # 2. Qtイベント処理
+            # ========================================
+            QApplication.processEvents()
+
+            # ========================================
+            # 3. メモリマップをクローズ
+            # ========================================
+            if hasattr(self, 'wv_loader') and self.wv_loader is not None:
+                try:
+                    self.wv_loader.close()
+                except Exception as e:
+                    pass  # エラーは無視して続行
+
+            # ========================================
+            # 4. 内部状態をリセット
+            # ========================================
+            self.total_samples = 0
+            self.sample_rate = 1.0
+            self.center_frequency = 0
+            self.region_start = 0
+            self.region_end = 100000
+
+            # ========================================
+            # 5. 強制ガベージコレクション（重要！）
+            # ========================================
+            import gc
+            gc.collect()
+
+
+        except Exception as e:
+            pass  # エラーは無視して続行
+
+    def load_file(self, file_path):
+        """
+        指定されたWVHファイルまたはiq.tarファイルを読み込む
+
+        Args:
+            file_path: ファイルパス（文字列またはPath）
+        """
+        # ファイル読み込み中はOverview ViewBox変更イベントを無視
+        self._programmatic_overview_update = True
+        print("[ファイル読み込み] プログラム制御モード ON")
+
+        try:
+            print("=" * 60)
+            print(f"[ファイル読み込み開始] {Path(file_path).name}")
+            print("=" * 60)
+
+            # ========================================
+            # 既存データのクリーンアップ（重要！）
+            # ========================================
+            print("既存データをクリーンアップ中...")
+            self.cleanup_previous_data()
+            print("クリーンアップ完了")
+
+            self.status_label.setText("ファイル読み込み中...")
+            QApplication.processEvents()
+
+            # ファイル形式判定
+            file_path_obj = Path(file_path)
+            if file_path_obj.suffix == '.tar' or file_path.endswith('.iq.tar'):
+                # iq.tarファイル
+                print(f"形式: iq.tar")
+                self.file_type = 'iqtar'
+                self.wv_loader = IQTarLoader()
+
+                # iq.tarファイル解析
+                print("iq.tarファイルを解析中...")
+                header = self.wv_loader.parse_iqtar(file_path)
+
+                # バイナリデータをメモリマップとして開く
+                print("データファイルをメモリマップで開いています...")
+                self.wv_loader.open_data()
+
+                # ファイル情報表示
+                fname = file_path_obj.name
+                size_gb = self.wv_loader.data_file_path.stat().st_size / 1e9
+                print(f"データサイズ: {size_gb:.2f} GB")
+
+            elif file_path_obj.suffix == '.wvh':
+                # WVHファイル
+                print(f"形式: WVH/WVD")
+                self.file_type = 'wv'
+                self.wv_loader = WVFileLoader()
+
+                # WVHヘッダー解析
+                print("WVHヘッダーを解析中...")
+                header = self.wv_loader.parse_wvh(file_path)
+
+                # WVDファイルをメモリマップとして開く
+                print("WVDファイルをメモリマップで開いています...")
+                self.wv_loader.open_wvd()
+
+                # ファイル情報表示
+                fname = file_path_obj.name
+                size_gb = self.wv_loader.wvd_path.stat().st_size / 1e9
+                print(f"WVDサイズ: {size_gb:.2f} GB")
+            else:
+                raise ValueError(f"未対応のファイル形式: {file_path_obj.suffix}")
+
+            # パラメータ取得
+            self.total_samples = header['SAMPLES']
+            self.sample_rate = header['CLOCK']
+            self.center_frequency = header.get('FREQUENCY', 0)
+
+            print(f"サンプル数: {self.total_samples:,}")
+            print(f"サンプリング周波数: {self.sample_rate/1e6:.2f} MHz")
+            print(f"中心周波数: {self.center_frequency/1e6:.2f} MHz")
+
+            # パンくずリストを読み込んだファイルのディレクトリに更新
+            file_dir = Path(fname).parent
+            self.update_breadcrumb(file_dir)
+
+            # ステータスバーに読み込み完了を表示（詳細情報含む）
+            self.status_label.setText(
+                f"✅ 読み込み完了: {fname} | {self.total_samples:,} samples | "
+                f"Fs={self.sample_rate/1e6:.1f} MHz | Fc={self.center_frequency/1e6:.1f} MHz | {size_gb:.2f} GB"
+            )
+
+            # Region初期化（中央50%）- 時間ベースで設定
+            initial_start = int(self.total_samples * 0.25)
+            initial_end = int(self.total_samples * 0.75)
+            initial_start_time = initial_start / self.sample_rate
+            initial_end_time = initial_end / self.sample_rate
+
+            # ファイル読み込み時はRegionシグナルをブロック
+            self.region.blockSignals(True)
+            self.region.setRegion((initial_start_time, initial_end_time))
+            self.region.blockSignals(False)
+
+            self.region_start = initial_start
+            self.region_end = initial_end
+            print(f"Region初期化: {initial_start:,} ~ {initial_end:,} (中央50%, {initial_start_time:.6f}s ~ {initial_end_time:.6f}s)")
+
+            # フルスパン波形の表示（Min-Maxダウンサンプリング）
+            print("フルスパン波形を表示中...")
+
+            # Overview波形の表示範囲をフルスパンにリセット（重要: Regionは50%のまま、表示のみフルスパン）
+            # フラグベース制御により、誤発火を防止
+            print("Overview表示範囲をフルスパンにリセット中...")
+            self.reset_overview_to_fullspan()
+            print("Overview表示範囲リセット完了")
+
+            # 中段波形の初期表示（Region範囲）
+            print("中段波形（Region範囲）を表示中...")
+            # ファイル読み込み時のイベントループを防止
+            self._event_state['programmatic_update'] = True
+            try:
+                self.update_region_waveform()
+            finally:
+                self._event_state['programmatic_update'] = False
+            print("中段波形表示完了")
+
+            # ボタン有効化
+            self.calc_spec_btn.setEnabled(True)
+            self.save_btn.setEnabled(True)
+
+            # WVH/WVD不整合チェックと自動修正（WV形式のみ）
+            if self.file_type == 'wv' and hasattr(self.wv_loader, 'header_mismatch') and self.wv_loader.header_mismatch:
+                self.prompt_fix_wvh_header()
+
+            print("=" * 60)
+            print("[ファイル読み込み完了]")
+            print("=" * 60)
+            self.status_label.setText("ファイル読み込み完了")
+
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"ファイル読み込みエラー:\n{e}")
+            self.status_label.setText(f"エラー: {e}")
+
+        finally:
+            # プログラム制御フラグをOFF（ユーザー操作を再び受け付ける）
+            self._programmatic_overview_update = False
+            print("[ファイル読み込み] プログラム制御モード OFF")
+
+    def _should_skip_event_processing(self, event_name):
+        """
+        統合的なイベント処理スキップチェック
+
+        Args:
+            event_name: イベント名（ログ出力用）
+
+        Returns:
+            True: イベント処理をスキップすべき
+            False: イベント処理を実行可能
+        """
+        # 終了処理中はスキップ（最優先）
+        if self._event_state.get('closing', False) or self.is_closing:
+            return True
+
+        # wv_loaderが存在しない場合はスキップ
+        if self.wv_loader is None:
+            return True
+
+        # スペクトログラム計算中はスキップ
+        if self._event_state.get('spectrogram_calculating', False) or self._spectrogram_calculating:
+            print(f"[{event_name}] スペクトログラム計算中のためスキップ")
+            return True
+
+        # プログラム制御中はスキップ
+        if self._event_state.get('programmatic_update', False):
+            print(f"[{event_name}] プログラム制御中のためスキップ")
+            return True
+
+        # _programmatic_overview_update の確認（後方互換性）
+        if hasattr(self, '_programmatic_overview_update') and self._programmatic_overview_update:
+            print(f"[{event_name}] プログラム制御中のためスキップ")
+            return True
+
+        # その他のイベント処理中チェック（必要に応じて）
+        if event_name == "Region変更" and self._event_state.get('viewbox_updating', False):
+            print(f"[{event_name}] ViewBox更新中のためスキップ")
+            return True
+
+        if event_name == "ViewBox変更" and self._event_state.get('region_updating', False):
+            print(f"[{event_name}] Region更新中のためスキップ")
+            return True
+
+        return False
+
+    def on_region_changed(self):
+        """
+        Region変更中の処理（ドラッグ中に連続呼び出し）
+
+        軽量な処理（Region波形の更新）のみ実行。
+        スペクトログラム計算は on_region_change_finished() で実行。
+        """
+        # 統合的なイベント処理チェック
+        if self._should_skip_event_processing("Region変更"):
+            return
+
+        # イベント処理中フラグを設定
+        self._event_state['region_updating'] = True
+
+        try:
+            region = self.region.getRegion()
+            # 時間（秒）からサンプル番号に変換
+            region_start_time, region_end_time = region
+            self.region_start = int(max(0, region_start_time * self.sample_rate))
+            self.region_end = int(min(self.total_samples, region_end_time * self.sample_rate))
+
+            # Region範囲の波形を更新（軽量処理）
+            # ViewBox更新によるイベント連鎖を防ぐため一時的にプログラム制御フラグを設定
+            self._event_state['programmatic_update'] = True
+            try:
+                self.update_region_waveform()
+            finally:
+                self._event_state['programmatic_update'] = False
+
+            # ステータス更新
+            samples = self.region_end - self.region_start
+            duration = samples / self.sample_rate
+
+            if duration < 1e-3:
+                duration_str = f"{duration*1e6:.2f} μs"
+            elif duration < 1:
+                duration_str = f"{duration*1e3:.2f} ms"
+            else:
+                duration_str = f"{duration:.3f} s"
+
+            # 自動更新状態をステータスに表示
+            auto_status = " [自動更新: ON]" if self.auto_update_spectrogram else ""
+            self.status_label.setText(
+                f"Region選択: {samples:,} samples ({duration_str}){auto_status}"
+            )
+
+            # 標準出力に情報を表示
+            print("-" * 60)
+            print(f"[Region変更]")
+            print(f"  範囲: {self.region_start:,} ~ {self.region_end:,}")
+            print(f"  サンプル数: {samples:,}")
+            print(f"  継続時間: {duration_str}")
+            print("-" * 60)
+        finally:
+            # イベント処理フラグをリセット
+            self._event_state['region_updating'] = False
+
+    def on_region_change_finished(self):
+        """
+        Region変更完了時の処理（ドラッグ完了後に1回だけ呼び出し）
+
+        重量級処理（スペクトログラム計算）を実行。
+        デバウンスタイマーを使用して、連続変更時は最後の変更から0.5秒後に計算開始。
+        """
+        # スペクトログラム自動更新（フラグがONの場合のみ）
+        if self.auto_update_spectrogram:
+            # デバウンスタイマーを再スタート（既に実行中なら中断して再開）
+            if not hasattr(self, 'spectrogram_update_timer'):
+                self.spectrogram_update_timer = QTimer()
+                self.spectrogram_update_timer.setSingleShot(True)
+                self.spectrogram_update_timer.timeout.connect(self.execute_spectrogram_calculation)
+
+            # タイマーを500ms後に設定
+            self.spectrogram_update_timer.start(500)
+            print("[Region変更完了] スペクトログラム計算を0.5秒後に開始します")
+        else:
+            print("[Region変更完了] 自動更新OFF")
+
+    def execute_spectrogram_calculation(self):
+        """
+        デバウンスタイマーから呼び出されるスペクトログラム計算実行メソッド
+
+        最後のRegion変更から0.5秒経過後に実行される。
+        """
+        print("[スペクトログラム自動計算] 開始")
+        self.calculate_spectrogram()
+
+    def update_region_waveform(self):
+        """
+        Region範囲の時間-振幅波形を更新（現在のself.region_start/end使用）
+
+        Region範囲のデータを読み込み、Min-Maxダウンサンプリングで表示。
+        スペクトログラムと横軸（時間軸）を連動させる。
+        """
+        self.update_region_waveform_with_range(self.region_start, self.region_end)
+
+    def update_region_waveform_with_range(self, start_sample, end_sample):
+        """
+        指定範囲の時間-振幅波形を更新
+
+        Args:
+            start_sample: 開始サンプル番号
+            end_sample: 終了サンプル番号
+
+        スペクトログラムと同じ範囲を表示するため、明示的に範囲を指定可能。
+        時間単位もスペクトログラムと統一。
+        """
+        # アプリケーション終了時などでwv_loaderがNoneの場合は処理をスキップ
+        if self.wv_loader is None or self.region_curve is None:
+            return
+
+        if self.total_samples == 0 or start_sample >= end_sample:
+            self.region_curve.setData([], [])
+            return
+
+        try:
+            # 目標ピクセル数（画面幅に応じて調整）
+            target_pixels = 4000
+
+            # Region範囲のMin-Maxダウンサンプリング（秒単位）
+            x_data, y_data = self._minmax_downsample(start_sample, end_sample, target_pixels)
+
+            # スペクトログラムの時間単位・スケールを取得
+            if hasattr(self.spectrogram_widget, 'time_unit') and self.spectrogram_widget.time_unit:
+                time_unit = self.spectrogram_widget.time_unit
+                # 時間スケール変換
+                if time_unit == 'ns':
+                    x_data_scaled = x_data * 1e9
+                elif time_unit == 'μs':
+                    x_data_scaled = x_data * 1e6
+                elif time_unit == 'ms':
+                    x_data_scaled = x_data * 1e3
+                else:  # 's'
+                    x_data_scaled = x_data
+
+                # 軸ラベル更新
+                self.region_plot.setLabel('bottom', '時間', units=time_unit)
+            else:
+                # スペクトログラムが未計算の場合は秒単位
+                x_data_scaled = x_data
+                time_unit = 's'
+                self.region_plot.setLabel('bottom', '時間', units='s')
+
+            # プロット更新
+            self.region_curve.setData(x_data_scaled, y_data)
+
+            # Y軸の自動スケーリング
+            self.region_plot.enableAutoRange(axis='y')
+
+            # X軸をRegion全範囲に設定（View All）
+            region_start_time = start_sample / self.sample_rate
+            region_end_time = end_sample / self.sample_rate
+
+            # スケール変換後の範囲
+            if time_unit == 'ns':
+                region_start_scaled = region_start_time * 1e9
+                region_end_scaled = region_end_time * 1e9
+            elif time_unit == 'μs':
+                region_start_scaled = region_start_time * 1e6
+                region_end_scaled = region_end_time * 1e6
+            elif time_unit == 'ms':
+                region_start_scaled = region_start_time * 1e3
+                region_end_scaled = region_end_time * 1e3
+            else:  # 's'
+                region_start_scaled = region_start_time
+                region_end_scaled = region_end_time
+
+            # ViewBox範囲設定時にイベントループを防止
+            region_viewbox = self.region_plot.getViewBox()
+
+            # プログラム制御中の場合、ViewBoxイベントを一時的にブロック
+            if self._event_state.get('programmatic_update', False):
+                # sigRangeChangedをブロック
+                region_viewbox.blockSignals(True)
+                region_viewbox.setXRange(region_start_scaled, region_end_scaled, padding=0)
+                region_viewbox.blockSignals(False)
+            else:
+                region_viewbox.setXRange(region_start_scaled, region_end_scaled, padding=0)
+
+            print(f"[Region波形更新] サンプル: {start_sample:,} ~ {end_sample:,} | 点数: {len(x_data):,} | View All: {region_start_scaled:.6f}{time_unit} ~ {region_end_scaled:.6f}{time_unit}")
+
+        except Exception as e:
+            print(f"[ERROR] Region波形の更新に失敗: {e}")
+            self.region_curve.setData([], [])
+
+    def _minmax_downsample(self, start_sample, end_sample, target_pixels):
+        """
+        Min-Maxダウンサンプリング
+
+        各ビン（区間）のMin/Max値を抽出することで、波形の包絡線を保持。
+        チャンク処理でメモリ効率を維持。
+
+        Args:
+            start_sample: 開始サンプル
+            end_sample: 終了サンプル
+            target_pixels: 目標ピクセル数
+
+        Returns:
+            (x_data, y_data): プロット用のXY配列
+        """
+        total_samples = end_sample - start_sample
+
+        # サンプル数が少ない場合はダウンサンプリング不要
+        # 3,200,000サンプル以下は実波形を表示（ユーザー要望）
+        if total_samples <= 3200000:
+            print(f"[実波形表示] サンプル数: {total_samples:,} <= 3,200,000 → 間引きなし")
+            # 全データをそのまま返す
+            iq_data = self.wv_loader.get_iq_data(start_sample, end_sample)
+            amplitudes = np.abs(iq_data)
+            # X座標を時間（秒）に変換
+            x_data = np.arange(start_sample, end_sample, dtype=np.float64) / self.sample_rate
+            y_data = amplitudes.astype(np.float32)
+            return x_data, y_data
+        else:
+            print(f"[Min-Max間引き] サンプル数: {total_samples:,} > 3,200,000 → target_pixels: {target_pixels}")
+
+        bin_size = max(1, total_samples // target_pixels)  # 最小値1を保証
+
+        # チャンクサイズ（100万サンプルずつ）
+        chunk_size = 1000000
+
+        x_mins = []
+        x_maxs = []
+        y_mins = []
+        y_maxs = []
+
+        # ビンごとに処理
+        for bin_idx in range(target_pixels):
+            bin_start = start_sample + bin_idx * bin_size
+            bin_end = min(start_sample + (bin_idx + 1) * bin_size, end_sample)
+
+            # このビン内のデータを読み込み（チャンク処理で）
+            if bin_end - bin_start > chunk_size:
+                # ビンが大きすぎる場合はさらにサンプリング
+                sample_indices = np.linspace(bin_start, bin_end - 1, min(chunk_size, bin_end - bin_start), dtype=np.int64)
+                iq_samples = []
+
+                # チャンクごとに読み込み
+                for i in range(0, len(sample_indices), chunk_size):
+                    chunk_idx_start = i
+                    chunk_idx_end = min(i + chunk_size, len(sample_indices))
+                    chunk_sample_idx = sample_indices[chunk_idx_start:chunk_idx_end]
+
+                    chunk_start_sample = int(chunk_sample_idx[0])
+                    chunk_end_sample = int(chunk_sample_idx[-1]) + 1
+
+                    chunk_data = self.wv_loader.get_iq_data(chunk_start_sample, chunk_end_sample)
+                    relative_idx = chunk_sample_idx - chunk_start_sample
+                    iq_samples.append(chunk_data[relative_idx])
+
+                iq_bin_data = np.concatenate(iq_samples)
+            else:
+                # ビンが小さい場合はそのまま読み込み
+                iq_bin_data = self.wv_loader.get_iq_data(bin_start, bin_end)
+
+            # 振幅計算
+            amplitudes = np.abs(iq_bin_data)
+
+            # Min/Max取得
+            min_val = np.min(amplitudes)
+            max_val = np.max(amplitudes)
+
+            # Min/Maxの位置（ビンの中央を代表値とする）- 時間（秒）に変換
+            bin_center = (bin_start + bin_end) / 2 / self.sample_rate
+
+            x_mins.append(bin_center)
+            x_maxs.append(bin_center)
+            y_mins.append(min_val)
+            y_maxs.append(max_val)
+
+        # Min/Maxを交互に配置（包絡線を描画）
+        x_data = np.empty(len(x_mins) * 2, dtype=np.float64)
+        y_data = np.empty(len(y_mins) * 2, dtype=np.float32)
+
+        x_data[0::2] = x_mins  # 偶数インデックス: Min
+        x_data[1::2] = x_maxs  # 奇数インデックス: Max
+        y_data[0::2] = y_mins
+        y_data[1::2] = y_maxs
+
+        return x_data, y_data
+
+    def show_fullspan_waveform(self):
+        """
+        全データ範囲の波形を表示（Min-Maxダウンサンプリング）
+
+        ファイル読み込み後に一度だけ呼び出され、全データ範囲の波形を
+        Min-Maxダウンサンプリングで表示する。Region変更時には再描画しない。
+        """
+        if self.total_samples == 0:
+            print("[WARNING] total_samples=0のため、フルスパン波形を表示できません")
+            return
+
+        print(f"フルスパン波形を計算中... (0 ~ {self.total_samples:,} samples)")
+
+        try:
+            # 画面幅に応じた目標ピクセル数（4000ピクセル分）
+            target_pixels = 4000
+
+            # Min-Maxダウンサンプリング
+            x_data, y_data = self._minmax_downsample(0, self.total_samples, target_pixels)
+
+            # プロット
+            self.overview_curve.setData(x_data, y_data)
+
+            # Y軸の自動スケーリングを有効化
+            self.overview_plot.enableAutoRange(axis='y')
+
+            print(f"フルスパン波形表示完了 ({len(x_data):,} points)")
+
+        except (MemoryError, np.core._exceptions._ArrayMemoryError) as e:
+            # メモリ不足エラーの場合、ユーザーに通知して続行
+            print(f"[ERROR] メモリ不足のため、フルスパン波形の表示をスキップします")
+            print(f"  ファイルサイズが大きすぎます: {self.total_samples:,} samples")
+            print(f"  解決策: より小さなRegion範囲を選択してください")
+            # プレースホルダーとして空のプロットを表示
+            self.overview_curve.setData([], [])
+        except Exception as e:
+            print(f"[ERROR] フルスパン波形の表示に失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            # プレースホルダーとして空のプロットを表示
+            self.overview_curve.setData([], [])
+
+    def on_overview_range_changed(self):
+        """
+        Overview波形のViewBox範囲変更時の処理
+
+        フラグベースの制御により、プログラムからの変更を無視する。
+
+        ズーム範囲に応じて波形を再計算：
+        - 表示範囲が3.2M以下: 実波形表示
+        - 表示範囲が3.2Mを超える: Min-Maxダウンサンプリング
+        """
+        # スペクトログラム計算中はスキップ（無限ループ防止 - 最重要）
+        if self._spectrogram_calculating:
+            print("[Overview範囲変更] スペクトログラム計算中のためスキップ")
+            return
+
+        # プログラム制御中はスキップ（プログラムからのViewBox変更を無視）
+        if self._programmatic_overview_update:
+            print("[Overview範囲変更] プログラム制御中のためスキップ")
+            return
+
+        # 処理中の場合はスキップ（連続したViewBox変更の並行実行を防止）
+        if self._overview_processing:
+            print("[Overview範囲変更] 既に処理中のためスキップ")
+            return
+
+        if self.total_samples == 0 or self.wv_loader is None:
+            return
+
+        # 処理ロックを取得し、ViewBoxのシグナルをブロック
+        self._overview_processing = True
+        self.overview_viewbox.blockSignals(True)
+
+        try:
+            # ViewBoxの表示範囲を取得
+            overview_viewbox = self.overview_plot.getViewBox()
+            view_range = overview_viewbox.viewRange()
+            x_min, x_max = view_range[0]
+
+            # Overview グラフは常に秒単位で動作
+            # （スペクトログラムの時間単位変換は適用しない）
+            x_min_sec = x_min
+            x_max_sec = x_max
+
+            # サンプル番号に変換
+            start_sample = int(max(0, x_min_sec * self.sample_rate))
+            end_sample = int(min(self.total_samples, x_max_sec * self.sample_rate))
+
+            if end_sample <= start_sample:
+                return
+
+            total_samples = end_sample - start_sample
+
+            print(f"[Overview ViewBox変更] 表示範囲: {start_sample:,} ~ {end_sample:,} ({total_samples:,} samples)")
+
+            # 3.2M以下なら実波形、それ以上ならMin-Max間引き
+            if total_samples <= 3200000:
+                print(f"[Overview実波形表示] サンプル数: {total_samples:,} <= 3,200,000 → 間引きなし")
+                # 全データをそのまま表示
+                iq_data = self.wv_loader.get_iq_data(start_sample, end_sample)
+                amplitudes = np.abs(iq_data)
+                x_data = np.arange(start_sample, end_sample, dtype=np.float64) / self.sample_rate
+                y_data = amplitudes.astype(np.float32)
+            else:
+                # Min-Maxダウンサンプリング
+                target_pixels = 4000
+                x_data, y_data = self._minmax_downsample(start_sample, end_sample, target_pixels)
+                print(f"[Overview Min-Max間引き] サンプル数: {total_samples:,} > 3,200,000 → target_pixels: {target_pixels}")
+
+            # プロット更新
+            self.overview_curve.setData(x_data, y_data)
+            print(f"[Overview波形更新] サンプル: {start_sample:,} ~ {end_sample:,} | 点数: {len(x_data):,}")
+
+        except Exception as e:
+            print(f"[ERROR] Overview ViewBox更新に失敗: {e}")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            # ViewBoxのシグナルブロックを解除し、処理ロックを解放
+            self.overview_viewbox.blockSignals(False)
+            self._overview_processing = False
+
+    def on_region_viewbox_changed(self):
+        """
+        Region plotのViewBox範囲変更時の処理
+
+        ズーム範囲に応じて波形を再計算。
+        - 表示範囲が3.2M以下: 実波形表示
+        - 表示範囲が3.2Mを超える: Min-Maxダウンサンプリング
+        """
+        # 統合的なイベント処理チェック
+        if self._should_skip_event_processing("ViewBox変更"):
+            return
+
+        # 処理中の場合はスキップ（並行実行を防止）
+        if hasattr(self, '_overview_processing') and self._overview_processing:
+            print("[ViewBox変更] 既に処理中のためスキップ")
+            return
+
+        # イベント処理中フラグを設定
+        self._event_state['viewbox_updating'] = True
+        self._overview_processing = True
+
+        try:
+            # ViewBoxの表示範囲を取得
+            region_viewbox = self.region_plot.getViewBox()
+            view_range = region_viewbox.viewRange()
+            x_min, x_max = view_range[0]
+
+            # スペクトログラムの時間単位を考慮
+            if hasattr(self.spectrogram_widget, 'time_unit') and self.spectrogram_widget.time_unit:
+                time_unit = self.spectrogram_widget.time_unit
+                # 秒単位に変換
+                if time_unit == 'ns':
+                    x_min_sec = x_min / 1e9
+                    x_max_sec = x_max / 1e9
+                elif time_unit == 'μs':
+                    x_min_sec = x_min / 1e6
+                    x_max_sec = x_max / 1e6
+                elif time_unit == 'ms':
+                    x_min_sec = x_min / 1e3
+                    x_max_sec = x_max / 1e3
+                else:  # 's'
+                    x_min_sec = x_min
+                    x_max_sec = x_max
+            else:
+                x_min_sec = x_min
+                x_max_sec = x_max
+
+            # サンプル番号に変換
+            start_sample = int(max(0, x_min_sec * self.sample_rate))
+            end_sample = int(min(self.total_samples, x_max_sec * self.sample_rate))
+
+            # Region範囲内に制限
+            start_sample = max(self.region_start, start_sample)
+            end_sample = min(self.region_end, end_sample)
+
+            if end_sample <= start_sample:
+                return
+
+            print(f"[ViewBox変更] 表示範囲: {start_sample:,} ~ {end_sample:,} ({end_sample - start_sample:,} samples)")
+
+            # 表示範囲の波形を再計算
+            self.update_region_waveform_with_range(start_sample, end_sample)
+
+        except Exception as e:
+            print(f"[ERROR] Region ViewBox更新に失敗: {e}")
+            import traceback
+            traceback.print_exc()
+
+        finally:
+            # イベント処理フラグをリセット
+            self._event_state['viewbox_updating'] = False
+            # 処理ロックを解放
+            self._overview_processing = False
+
+    def update_overview_waveform(self):
+        """
+        ViewBox範囲に応じたRegion波形の再計算
+
+        表示範囲とピクセル幅に応じて適切なMin-Maxダウンサンプリングを実行。
+        """
+        if self.total_samples == 0:
+            return
+
+        try:
+            # ViewBoxの表示範囲を取得（時間、秒）
+            view_range = self.overview_viewbox.viewRange()
+            x_min, x_max = view_range[0]
+
+            # 時間（秒）からサンプル番号に変換
+            start_sample = int(max(0, x_min * self.sample_rate))
+            end_sample = int(min(self.total_samples, x_max * self.sample_rate))
+
+            if end_sample <= start_sample:
+                return
+
+            # ViewBoxのピクセル幅を取得
+            view_rect = self.overview_viewbox.viewRect()
+            widget_rect = self.overview_plot.rect()
+
+            # ピクセル幅を推定（ウィジェット幅の80%程度）
+            target_pixels = int(widget_rect.width() * 0.8)
+            target_pixels = max(100, min(target_pixels, 4000))  # 100-4000の範囲
+
+            # Min-Maxダウンサンプリング
+            x_data, y_data = self._minmax_downsample(start_sample, end_sample, target_pixels)
+
+            # プロット更新
+            self.overview_curve.setData(x_data, y_data)
+
+            # Y軸は常に自動調整（X軸のみ変更）
+            self.overview_plot.enableAutoRange(axis='y')
+
+            print(f"[ViewBox更新] 範囲: {start_sample:,} ~ {end_sample:,} | ピクセル: {target_pixels} | 点数: {len(x_data):,}")
+
+        except Exception as e:
+            print(f"[ERROR] Region波形の更新に失敗: {e}")
+
+    def on_overview_mouse_clicked(self, event):
+        """
+        Region波形のマウスクリックイベント処理
+
+        右クリック時にカスタムコンテキストメニューを表示。
+        元のpyqtgraphメニューは左クリック時に表示される。
+        """
+        if event.button() == Qt.RightButton:
+            # 右クリック時：カスタムメニューを表示
+            self.show_overview_context_menu(event.screenPos())
+            event.accept()
+        # 左クリックは通常処理（pyqtgraphのデフォルト動作）
+
+    def show_overview_context_menu(self, screen_pos):
+        """
+        Region波形のカスタムコンテキストメニューを表示
+
+        Args:
+            screen_pos: メニュー表示位置（QPointF、スクリーン座標）
+        """
+        menu = QMenu()
+        menu.setStyleSheet(f"QMenu {{ font-size: {self.font_size_large}pt; }}")
+
+        # フルスパンに戻るアクション
+        reset_action = menu.addAction("🔄 フルスパン表示に戻る")
+        reset_action.triggered.connect(self.reset_overview_to_fullspan)
+
+        # 表示範囲をRegionとして設定
+        set_region_action = menu.addAction("📍 表示範囲をRegionに設定")
+        set_region_action.triggered.connect(self.set_viewrange_as_region)
+
+        # メニュー表示
+        menu.exec(screen_pos.toPoint())
+
+    def reset_overview_to_fullspan(self):
+        """
+        Region波形をフルスパン表示に戻す
+
+        X軸の表示範囲を全データ範囲（0 ~ total_time）にリセット。
+        フラグベース制御により、ViewBox変更イベントの誤発火を防止。
+        """
+        if self.total_samples == 0:
+            return
+
+        # プログラム制御フラグをON（ViewBox変更イベントを無視させる）
+        self._programmatic_overview_update = True
+        print("[フルスパン表示] プログラム制御モード ON")
+
+        try:
+            # 時間範囲を計算（秒）
+            total_time = self.total_samples / self.sample_rate
+
+            # ViewBoxの範囲を全データ範囲に設定（時間ベース）
+            self.overview_viewbox.setXRange(0, total_time, padding=0)
+
+            print(f"[フルスパン表示] ViewBox範囲を設定: 0 ~ {total_time:.6f} s = {self.total_samples:,} samples")
+
+            # フルスパン波形を明示的に表示
+            self.show_fullspan_waveform()
+
+            print("[フルスパン表示] 完了")
+
+        finally:
+            # プログラム制御フラグをOFF（ユーザー操作を再び受け付ける）
+            self._programmatic_overview_update = False
+            print("[フルスパン表示] プログラム制御モード OFF")
+
+    def set_viewrange_as_region(self):
+        """
+        現在の表示範囲をRegionとして設定
+
+        ズームイン状態で、表示されている範囲をスペクトログラム解析の
+        Region範囲として設定する。
+        """
+        if self.total_samples == 0:
+            return
+
+        # ViewBoxの現在の表示範囲を取得（時間、秒）
+        view_range = self.overview_viewbox.viewRange()
+        x_min, x_max = view_range[0]
+
+        # 時間（秒）からサンプル数に変換（境界チェック）
+        new_start = int(max(0, x_min * self.sample_rate))
+        new_end = int(min(self.total_samples, x_max * self.sample_rate))
+
+        if new_end <= new_start:
+            print("[WARNING] 無効な表示範囲です")
+            return
+
+        # Regionを更新（時間ベースで設定）
+        # プログラムによる更新時はシグナルをブロック
+        self._event_state['programmatic_update'] = True
+        self.region.blockSignals(True)
+        try:
+            self.region.setRegion((x_min, x_max))
+        finally:
+            self.region.blockSignals(False)
+            self._event_state['programmatic_update'] = False
+
+        self.region_start = new_start
+        self.region_end = new_end
+
+        # ステータス更新
+        samples = new_end - new_start
+        duration = samples / self.sample_rate
+
+        if duration < 1e-3:
+            duration_str = f"{duration*1e6:.2f} μs"
+        elif duration < 1:
+            duration_str = f"{duration*1e3:.2f} ms"
+        else:
+            duration_str = f"{duration:.3f} s"
+
+        print(f"[Region更新] 表示範囲をRegionに設定: {new_start:,} ~ {new_end:,} ({samples:,} samples, {duration_str})")
+
+        # 自動更新がONの場合はスペクトログラムを計算
+        if self.auto_update_spectrogram:
+            self.calculate_spectrogram()
+
+    def auto_optimize_spectrogram_params(self, region_samples):
+        """
+        Region範囲のサンプル数に基づいて、スペクトログラムパラメータを自動最適化
+
+        信号を漏れなく抽出するため、以下の戦略を採用：
+        1. 短いパルス → 小さいNFFT（高時間分解能）+ 高オーバーラップ
+        2. 長い信号 → 大きいNFFT（高周波数分解能）+ 中程度オーバーラップ
+        3. 時間分解能とメモリ使用量のバランスを考慮
+
+        Args:
+            region_samples: Region範囲のサンプル数
+
+        Returns:
+            tuple: (最適NFFT, 最適オーバーラップ率%, ウィンドウ関数名, 推奨メッセージ)
+        """
+        # 時間長を計算（秒）
+        duration_sec = region_samples / self.sample_rate
+
+        # 時間長に応じた最適パラメータを決定
+        if duration_sec < 1e-6:  # 1 μs未満（極短パルス）
+            optimal_nfft = 64
+            optimal_overlap = 90
+            window = 'blackmanharris'  # サイドローブ抑圧重視
+            msg = "極短パルス検出: 最高時間分解能モード"
+        elif duration_sec < 10e-6:  # 10 μs未満（短パルス）
+            optimal_nfft = 128
+            optimal_overlap = 87.5
+            window = 'blackmanharris'
+            msg = "短パルス検出: 高時間分解能モード"
+        elif duration_sec < 100e-6:  # 100 μs未満
+            optimal_nfft = 256
+            optimal_overlap = 85
+            window = 'blackmanharris'
+            msg = "中短パルス検出: 高時間分解能モード"
+        elif duration_sec < 1e-3:  # 1 ms未満
+            optimal_nfft = 512
+            optimal_overlap = 80
+            window = 'hann'  # バランス型
+            msg = "中間長信号: バランスモード"
+        elif duration_sec < 10e-3:  # 10 ms未満
+            optimal_nfft = 1024
+            optimal_overlap = 75
+            window = 'hann'
+            msg = "中長信号: 標準モード"
+        elif duration_sec < 100e-3:  # 100 ms未満
+            optimal_nfft = 2048
+            optimal_overlap = 70
+            window = 'hann'
+            msg = "長信号: 高周波数分解能モード"
+        else:  # 100 ms以上
+            optimal_nfft = 4096
+            optimal_overlap = 65
+            window = 'hann'
+            msg = "超長信号: 最高周波数分解能モード"
+
+        # メモリ制約チェック（8GB RAM環境で処理可能な範囲に調整）
+        # ユーザー要望: 遅くなっても構わないので8GBマシンで処理できるようにする
+        max_memory_mb = 4000  # 最大4GB使用（8GB RAM環境を想定）
+        iq_data_mb = (region_samples * 8) / 1024 / 1024
+        time_frames = int(region_samples / (optimal_nfft * (1 - optimal_overlap/100)))
+        spectrogram_mb = (optimal_nfft * time_frames * 4) / 1024 / 1024
+        total_mb = iq_data_mb + spectrogram_mb
+
+        # メモリ超過の場合のみ、NFFTを増やしてフレーム数を削減
+        # 4GB以内であれば、時間がかかっても最適なパラメータを維持
+        if total_mb > max_memory_mb:
+            print(f"[メモリ最適化] 推定メモリ {total_mb:.0f} MB > 制限 {max_memory_mb} MB")
+            while total_mb > max_memory_mb and optimal_nfft < 16384:
+                optimal_nfft *= 2
+                optimal_overlap = max(50, optimal_overlap - 5)  # オーバーラップも削減
+                time_frames = int(region_samples / (optimal_nfft * (1 - optimal_overlap/100)))
+                spectrogram_mb = (optimal_nfft * time_frames * 4) / 1024 / 1024
+                total_mb = iq_data_mb + spectrogram_mb
+            msg += " (メモリ制約により調整)"
+            print(f"  調整後: NFFT={optimal_nfft}, メモリ={total_mb:.0f} MB")
+
+        return optimal_nfft, optimal_overlap, window, msg
+
+    def calculate_spectrogram(self):
+        """
+        Region範囲のスペクトログラム計算（信号抽出最適化版）
+
+        メモリ効率を考慮し、適切なNFFT、オーバーラップを使用。
+        短いパルスも漏れなく抽出するため、自動パラメータ最適化を実装。
+        大容量データでもメモリエラーが発生しないよう注意深く実装。
+        """
+        if self.region_start >= self.region_end:
+            QMessageBox.warning(self, "警告", "有効なRegion範囲を選択してください")
+            return
+
+        # スペクトログラム計算中フラグを設定（無限ループ防止 - 最優先）
+        self._spectrogram_calculating = True
+        print("[スペクトログラム計算] 計算開始 - Region変更イベントをブロック中")
+
+        # ViewBoxトラッキングを完全に切断（無限ループ防止）
+        # タイマー停止だけでは不十分：シグナルも切断する必要がある
+        if hasattr(self, 'region_viewbox') and hasattr(self, '_region_viewbox_handler'):
+            try:
+                self.region_viewbox.sigRangeChanged.disconnect(self._region_viewbox_handler)
+                print("[Region ViewBoxトラッキング] シグナル切断完了")
+            except Exception as e:
+                print(f"[Region ViewBoxトラッキング] シグナル切断エラー: {e}")
+
+        try:
+            # スペクトログラム計算に使用する範囲を保存（中段波形との同期用）
+            spectrogram_start = self.region_start
+            spectrogram_end = self.region_end
+            region_samples = spectrogram_end - spectrogram_start
+
+            # パラメータ自動最適化（信号漏れ防止）
+            optimal_nfft, optimal_overlap, optimal_window, opt_msg = \
+                self.auto_optimize_spectrogram_params(region_samples)
+
+            # 現在のUI設定値を取得
+            current_nfft = self.nfft_spin.value()
+            current_overlap = self.overlap_spin.value()
+
+            # 最適化パラメータを自動適用（ダイアログなし）
+            nfft = optimal_nfft
+            overlap_percent = optimal_overlap
+            window = optimal_window
+
+            # UI設定を更新
+            self.nfft_spin.setValue(nfft)
+            self.overlap_spin.setValue(overlap_percent)
+
+            # ログ出力
+            if abs(current_nfft - optimal_nfft) > optimal_nfft * 0.5 or \
+               abs(current_overlap - optimal_overlap) > 20:
+                print(f"[パラメータ自動最適化] {opt_msg}")
+                print(f"  NFFT: {current_nfft} → {nfft}")
+                print(f"  オーバーラップ: {current_overlap}% → {overlap_percent}%")
+                print(f"  ウィンドウ: {window}")
+            else:
+                print(f"[パラメータ最適化] {opt_msg}")
+                print(f"  NFFT: {nfft}, オーバーラップ: {overlap_percent}%, ウィンドウ: {window}")
+
+            # メモリ使用量推定（8GB RAM環境での安全性チェック）
+            iq_data_mb = (region_samples * 8) / 1024 / 1024  # complex64
+            time_frames = int(region_samples / (nfft * (1 - overlap_percent/100)))
+            spectrogram_mb = (nfft * time_frames * 4) / 1024 / 1024  # float32
+            total_estimated_mb = iq_data_mb + spectrogram_mb
+
+            # メモリ使用量をログに出力（警告ダイアログは表示しない）
+            if total_estimated_mb > 2000:
+                print(f"[メモリ使用量] 推定 {total_estimated_mb/1024:.2f} GB（大容量処理）")
+                print(f"  8GB RAM環境では処理に時間がかかる可能性があります")
+                # ダイアログなしで処理を続行
+
+            # 計算中の表示と操作制限
+            self.status_label.setText("⏳ スペクトログラム計算中...")
+            self.calc_spec_btn.setEnabled(False)
+            self.calc_spec_btn.setText("計算中...")
+            QApplication.processEvents()
+
+            print("=" * 60)
+            print("[スペクトログラム計算開始]")
+            print(f"  サンプル数: {region_samples:,}")
+            print(f"  時間長: {region_samples/self.sample_rate*1e6:.3f} μs")
+            print(f"  NFFT: {nfft}")
+            print(f"  オーバーラップ: {overlap_percent}%")
+            print(f"  ウィンドウ関数: {window}")
+            print(f"  推定メモリ使用量: {total_estimated_mb:.1f} MB")
+            print("=" * 60)
+
+            # パラメータ取得
+            noverlap = int(nfft * overlap_percent / 100)
+
+            # IQデータ取得（保存した範囲を使用）
+            print("IQデータを読み込み中...")
+            iq_data = self.wv_loader.get_iq_data(
+                start_sample=spectrogram_start,
+                end_sample=spectrogram_end
+            )
+            print(f"データ読み込み完了: {len(iq_data):,} samples")
+
+            # スペクトログラム計算（最大値保持版）
+            print("スペクトログラムを計算中（最大値保持モード）...")
+            # fs: サンプリング周波数
+            # nperseg: セグメント長 = NFFT
+            # noverlap: オーバーラップサンプル数
+            # window: 最適化されたウィンドウ関数（信号漏れ防止）
+
+            # ウィンドウ関数を生成
+            if window == 'hann':
+                win = np.hanning(nfft)
+            elif window == 'blackmanharris':
+                win = np.blackman(nfft)
+            else:
+                win = np.hanning(nfft)  # デフォルト
+
+            # STFT実行（各時間フレームごとにFFT）
+            hop_length = nfft - noverlap
+            num_frames = 1 + (len(iq_data) - nfft) // hop_length
+
+            # 周波数ビンの定義
+            frequencies = np.fft.fftfreq(nfft, d=1/self.sample_rate)
+            frequencies = np.fft.fftshift(frequencies)  # [-fs/2, 0, fs/2]に並び替え
+
+            # 時間軸の定義
+            times = np.arange(num_frames) * hop_length / self.sample_rate
+
+            # スペクトログラム配列を初期化（周波数×時間）
+            sxx = np.zeros((nfft, num_frames), dtype=np.float32)
+
+            # 各時間フレームごとにFFTを実行し、パワースペクトルを計算
+            print(f"  フレーム数: {num_frames}, ホップ長: {hop_length}")
+            for i in range(num_frames):
+                start_idx = i * hop_length
+                end_idx = start_idx + nfft
+
+                # フレーム切り出し
+                frame = iq_data[start_idx:end_idx]
+
+                # ウィンドウ適用
+                windowed_frame = frame * win
+
+                # FFT実行
+                fft_result = np.fft.fft(windowed_frame)
+
+                # パワースペクトル（絶対値の2乗）
+                power_spectrum = np.abs(fft_result) ** 2
+
+                # 周波数軸を並び替え
+                power_spectrum = np.fft.fftshift(power_spectrum)
+
+                # スペクトログラムに格納
+                sxx[:, i] = power_spectrum
+
+                # 進捗表示（100フレームごと）
+                if (i + 1) % 100 == 0 or i == num_frames - 1:
+                    progress = (i + 1) / num_frames * 100
+                    print(f"  進捗: {progress:.1f}% ({i+1}/{num_frames})")
+
+            # パワーをdBに変換
+            sxx_db = 10 * np.log10(sxx + 1e-12)  # ゼロ除算防止
+
+            print(f"計算完了")
+            print(f"  スペクトログラム形状: {sxx_db.shape}")
+            print(f"  周波数ビン数: {len(frequencies)}")
+            print(f"  時間フレーム数: {len(times)}")
+            print(f"  周波数範囲: {frequencies[0]/1e6:.2f} ~ {frequencies[-1]/1e6:.2f} MHz")
+            print("=" * 60)
+
+            # 時間軸を全データ内の絶対時間に変換
+            # scipy.signal.spectrogramは0から始まる相対時間を返すため、
+            # Region開始位置の時刻を加算して絶対時刻に変換
+            region_start_time = spectrogram_start / self.sample_rate
+            times_absolute = times + region_start_time
+
+            # 表示更新
+            print("スペクトログラムを表示中...")
+
+            # スペクトログラム更新中はRegionウィジェット全体のシグナルをブロック
+            # （無限ループ防止 - Qt公式メソッド）
+            self.region.blockSignals(True)
+
+            try:
+                if self.spectrogram_widget is not None:
+                    self.spectrogram_widget.update_spectrogram(
+                        frequencies,
+                        times_absolute,  # 絶対時刻を使用
+                        sxx_db,
+                        center_freq=self.center_frequency
+                    )
+                else:
+                    print("[ERROR] spectrogram_widgetがNoneです")
+            finally:
+                # シグナルブロックを解除
+                self.region.blockSignals(False)
+                print("[Region シグナルブロック解除]")
+
+            print("[スペクトログラム計算完了]")
+
+            # スペクトログラム表示最適化後の最終的なRegion範囲を取得して、
+            # 中段波形を同期更新（Region範囲が変更されている可能性があるため）
+            region = self.region.getRegion()
+            region_start_time, region_end_time = region
+            self.region_start = int(max(0, region_start_time * self.sample_rate))
+            self.region_end = int(min(self.total_samples, region_end_time * self.sample_rate))
+
+            # 中段波形を最終的なRegion範囲で更新
+            # プログラム制御フラグを設定してイベントループを防止
+            print(f"[スペクトログラム完了後の同期] Region範囲: {self.region_start} ~ {self.region_end}")
+            self._event_state['programmatic_update'] = True
+            try:
+                self.update_region_waveform()
+            finally:
+                self._event_state['programmatic_update'] = False
+
+            self.status_label.setText("✓ スペクトログラム計算完了")
+
+        except MemoryError:
+            QMessageBox.critical(
+                self,
+                "メモリエラー",
+                "メモリ不足です。NFFT値を小さくするか、Region範囲を狭めてください。"
+            )
+            self.status_label.setText("❌ メモリエラー")
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"スペクトログラム計算エラー:\n{e}")
+            self.status_label.setText(f"❌ エラー: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            # ViewBoxトラッキングを再接続（正常終了/エラー終了に関わらず）
+            if hasattr(self, 'region_viewbox') and hasattr(self, '_region_viewbox_handler'):
+                try:
+                    self.region_viewbox.sigRangeChanged.connect(self._region_viewbox_handler)
+                    print("[Region ViewBoxトラッキング] シグナル再接続完了")
+                except Exception as e:
+                    print(f"[Region ViewBoxトラッキング] シグナル再接続エラー: {e}")
+
+            # スペクトログラム計算中フラグをOFF（正常終了/エラー終了に関わらず）
+            self._spectrogram_calculating = False
+            print("[スペクトログラム計算] 計算完了 - Region変更イベントのブロック解除")
+
+            # ボタンの状態を復元
+            self.calc_spec_btn.setEnabled(True)
+            self.calc_spec_btn.setText("スペクトログラム計算 (手動)")
+
+    def save_region(self):
+        """Region範囲のデータをWVH/WVD形式で保存"""
+        if self.region_start >= self.region_end:
+            QMessageBox.warning(self, "警告", "有効なRegion範囲を選択してください")
+            return
+
+        # デフォルトファイル名生成
+        if self.file_type == 'wv' and hasattr(self.wv_loader, 'wvh_path') and self.wv_loader.wvh_path:
+            default_name = self.wv_loader.wvh_path.stem + f"_region_{self.region_start}_{self.region_end}"
+        elif self.file_type == 'iqtar' and hasattr(self.wv_loader, 'tar_path') and self.wv_loader.tar_path:
+            default_name = self.wv_loader.tar_path.stem + f"_region_{self.region_start}_{self.region_end}"
+        else:
+            default_name = f"region_{self.region_start}_{self.region_end}"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "保存先を選択（WVH/WVD形式）",
+            default_name,
+            "WV Files (*.wvh);;All Files (*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            self.status_label.setText("データ保存中...")
+            QApplication.processEvents()
+
+            print("=" * 60)
+            print("[Region保存開始]")
+            print(f"  保存先: {file_path}")
+            print(f"  Range: {self.region_start:,} ~ {self.region_end:,}")
+            print(f"  サンプル数: {self.region_end - self.region_start:,}")
+            print("=" * 60)
+
+            # IQデータ取得
+            print("IQデータを読み込み中...")
+            iq_data = self.wv_loader.get_iq_data(
+                start_sample=self.region_start,
+                end_sample=self.region_end
+            )
+            print(f"データ読み込み完了: {len(iq_data):,} samples")
+
+            # IQデータをint16形式に変換（WVH/WVD形式はRAW16LE）
+            # iq.tarの場合はfloat32なので、適切にスケーリングが必要
+            if self.file_type == 'iqtar':
+                # float32 -> int16 変換
+                # 正規化してint16の範囲にマッピング
+                max_val = np.max(np.abs(iq_data))
+                if max_val > 0:
+                    # int16の最大値（32767）でスケーリング
+                    scale_factor = 32767.0 / max_val
+                    iq_data_scaled = iq_data * scale_factor
+                else:
+                    iq_data_scaled = iq_data
+
+                # int16範囲にクリップ
+                iq_data = np.clip(iq_data_scaled, -32768, 32767)
+
+            # WVH/WVD形式で保存
+            # ヘッダー情報は元ファイルから継承（TYPE, COMPONENTS等は上書き）
+            header_template = self.wv_loader.header.copy()
+
+            # WVH/WVD形式に必要なフィールドを追加/上書き
+            if self.file_type == 'iqtar':
+                header_template['TYPE'] = 'RAW16LE'
+                header_template['COMPONENTS'] = 'IQ'
+                header_template['RESOLUTION'] = 16
+
+            print("WVH/WVD形式で保存中...")
+            wvh_path, wvd_path = WVFileLoader.save_region_as_wv(
+                save_path=file_path,
+                iq_data=iq_data,
+                header_template=header_template
+            )
+
+            wvd_size_mb = wvd_path.stat().st_size / 1e6
+            print(f"保存完了:")
+            print(f"  WVHファイル: {wvh_path.name}")
+            print(f"  WVDファイル: {wvd_path.name} ({wvd_size_mb:.2f} MB)")
+            print("=" * 60)
+            print("[Region保存完了]")
+            print("=" * 60)
+
+            # 標準出力に情報を表示
+            self.status_label.setText(f"✅ 保存完了: {wvh_path.name}, {wvd_path.name}")
+            QMessageBox.information(
+                self,
+                "完了",
+                f"Region範囲を保存しました:\n\n"
+                f"WVH: {wvh_path.name}\n"
+                f"WVD: {wvd_path.name}\n"
+                f"サンプル数: {len(iq_data):,}"
+            )
+
+        except Exception as e:
+            QMessageBox.critical(self, "エラー", f"保存エラー:\n{e}")
+            self.status_label.setText(f"保存エラー: {e}")
+            import traceback
+            traceback.print_exc()
+
+    def on_colormap_changed(self, colormap_name):
+        """カラーマップ変更"""
+        self.spectrogram_widget.set_colormap(colormap_name)
+
+    def on_cutoff_changed(self, value):
+        """
+        下位カットオフ変更時の処理
+
+        スペクトログラムの表示レベルを再調整して、
+        ノイズフロアをカットし小信号を相対的に強調する。
+
+        Args:
+            value: 下位カットオフパーセンタイル (%)
+        """
+        if not hasattr(self.spectrogram_widget, 'current_sxx_db'):
+            # スペクトログラムがまだ計算されていない
+            return
+
+        sxx_db = self.spectrogram_widget.current_sxx_db
+
+        # パーセンタイルベースでレベルを再計算
+        min_level = np.percentile(sxx_db, value)
+        max_level = np.percentile(sxx_db, 100)  # 最大値は固定
+
+        # レベルを更新
+        self.spectrogram_widget.hist.setLevels(min_level, max_level)
+        self.spectrogram_widget.img_item.setLevels([min_level, max_level])
+
+        # 更新された値を保存
+        self.spectrogram_widget.current_min_level = min_level
+
+    def update_memory_info(self):
+        """
+        メモリ使用量を更新して表示
+
+        macOSとWindows 11の両方に対応。
+        """
+        try:
+            # システムメモリ情報を取得
+            memory = psutil.virtual_memory()
+
+            # 使用中メモリと総メモリ（GB単位）
+            used_gb = memory.used / (1024 ** 3)
+            total_gb = memory.total / (1024 ** 3)
+            percent = memory.percent
+
+            # 色分け：80%以上で警告色
+            if percent >= 80:
+                color = "#ff6b6b"  # 赤
+            elif percent >= 60:
+                color = "#ffa500"  # オレンジ
+            else:
+                color = "#888888"  # グレー
+
+            # ラベル更新
+            self.memory_label.setText(f"メモリ: {used_gb:.1f} / {total_gb:.1f} GB ({percent:.0f}%)")
+            self.memory_label.setStyleSheet(f"font-size: {self.font_size_large}pt; padding: 5px; color: {color};")
+
+        except Exception as e:
+            # エラー時はデフォルト表示
+            self.memory_label.setText("メモリ: -- / -- GB")
+            self.memory_label.setStyleSheet(f"font-size: {self.font_size_large}pt; padding: 5px; color: #888888;")
+
+    def on_auto_update_changed(self, state):
+        """
+        自動更新チェックボックス変更時の処理
+
+        Args:
+            state: チェック状態（Qt.Checked または Qt.Unchecked）
+        """
+        from PySide6.QtCore import Qt
+        self.auto_update_spectrogram = (state == Qt.CheckState.Checked.value)
+
+        if self.auto_update_spectrogram:
+            # ONにした瞬間に一度計算
+            if self.total_samples > 0 and self.region_start < self.region_end:
+                self.calculate_spectrogram()
+        else:
+            pass  # 自動更新OFF
+
+        # ステータス更新
+        self.on_region_changed()
+
+
+    def append_stdout(self, text):
+        """
+        標準出力テキストをテキストエリアに追加
+
+        print()の出力ごとに即座に表示されるようにUIを強制更新する。
+        ただし、終了処理中はprocessEvents()を呼ばない（segfault回避）。
+
+        Args:
+            text: 追加するテキスト
+        """
+        # 終了処理中は何もしない（Segmentation fault回避）
+        if self.is_closing:
+            return
+
+        try:
+            # テキストを追加
+            self.stdout_text.append(text.rstrip())
+
+            # 自動スクロール（最新の出力が常に表示される）
+            cursor = self.stdout_text.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.stdout_text.setTextCursor(cursor)
+
+            # 最大行数制限（メモリ節約のため、古い行を削除）
+            max_lines = 1000
+            text_lines = self.stdout_text.toPlainText().split('\n')
+            if len(text_lines) > max_lines:
+                # 古い行を削除
+                self.stdout_text.setPlainText('\n'.join(text_lines[-max_lines:]))
+                # カーソルを最後に移動
+                cursor = self.stdout_text.textCursor()
+                cursor.movePosition(QTextCursor.End)
+                self.stdout_text.setTextCursor(cursor)
+
+            # UIを即座に更新（print()ごとにリアルタイム表示）
+            # ただし終了処理中は呼ばない
+            if not self.is_closing:
+                QCoreApplication.processEvents()
+        except:
+            # 終了処理中にオブジェクトが削除されている場合は無視
+            pass
+
+    def safe_exit(self):
+        """
+        安全にアプリケーションを終了
+
+        確認ダイアログなしで、適切なクリーンアップ処理を実行してから終了。
+        closeEventでクリーンアップが行われるため、ここでは最小限の処理のみ。
+        """
+        # ウィンドウを閉じる（closeEventが呼ばれてクリーンアップされる）
+        self.close()
+
+    def prompt_fix_wvh_header(self):
+        """
+        WVH/WVD不整合検出時に修正を促すダイアログ
+
+        ユーザーに確認し、承認された場合は自動的にWVHファイルを修正する。
+        """
+        # 不整合の詳細情報
+        actual_samples = self.wv_loader.header['SAMPLES']
+        wvh_path = self.wv_loader.wvh_path
+        wvd_path = self.wv_loader.wvd_path
+
+        message = (
+            f"WVHヘッダーとWVDファイルサイズに不整合が検出されました。\n\n"
+            f"ファイル: {wvh_path.name}\n"
+            f"実際のサンプル数: {actual_samples:,}\n\n"
+            f"WVDファイルに問題がないことを確認しました。\n"
+            f"元のWVHファイルを .bak として保存し、\n"
+            f"正しいヘッダー情報を含む新しいWVHファイルを作成しますか？"
+        )
+
+        reply = QMessageBox.question(
+            self,
+            "WVHファイル修正の確認",
+            message,
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+
+        if reply == QMessageBox.Yes:
+            try:
+                # WVHファイル修正実行
+                self.wv_loader.fix_wvh_header()
+
+                QMessageBox.information(
+                    self,
+                    "修正完了",
+                    f"WVHファイルを修正しました。\n\n"
+                    f"元のファイル: {wvh_path.with_suffix('.wvh.bak').name}\n"
+                    f"修正後: {wvh_path.name}\n"
+                    f"正しいサンプル数: {actual_samples:,}"
+                )
+
+            except Exception as e:
+                QMessageBox.critical(
+                    self,
+                    "修正エラー",
+                    f"WVHファイルの修正中にエラーが発生しました:\n{e}"
+                )
+        else:
+            QMessageBox.information(
+                self,
+                "キャンセル",
+                "WVHファイルは修正されませんでした。\n"
+                "実際のWVDファイルサイズに基づいてデータを読み込みます。"
+            )
+
+    def closeEvent(self, event):
+        """
+        ウィンドウクローズ時のクリーンアップ
+
+        Segmentation fault回避のため、以下の順序で解放:
+        0. 終了フラグをセット（これ以降はprocessEvents()を呼ばない）
+        1. 標準出力のシグナル接続を切断（最優先）
+        2. メモリ更新タイマーを停止
+        3. メモリマップを先にクローズ
+        4. プロットデータをクリア
+        5. 標準出力を元に戻す
+        6. ガベージコレクション
+
+        Cmd+Q（Ctrl+Q）でも安全に終了できるよう設計。
+        """
+        try:
+            # 0. 終了フラグをセット（これ以降、append_stdoutはprocessEvents()を呼ばない）
+            self.is_closing = True
+
+            # 1. 標準出力のシグナル接続を最初に切断（最重要！）
+            if hasattr(self, 'stdout_redirector') and self.stdout_redirector:
+                try:
+                    # シグナル接続を切断
+                    self.stdout_redirector.text_written.disconnect()
+                except:
+                    pass
+                try:
+                    # 標準出力を元に戻す
+                    sys.stdout = self.stdout_redirector.original_stdout
+                    self.stdout_redirector = None
+                except:
+                    pass
+
+            # 2. メモリ更新タイマーを停止
+            if hasattr(self, 'memory_timer') and self.memory_timer:
+                try:
+                    self.memory_timer.stop()
+                    self.memory_timer.deleteLater()
+                    self.memory_timer = None
+                except:
+                    pass
+
+            # 3. すべてのシグナル接続を切断
+            try:
+                if hasattr(self, 'region') and self.region is not None:
+                    try:
+                        self.region.sigRegionChanged.disconnect()
+                    except:
+                        pass
+                    try:
+                        self.region.sigRegionChangeFinished.disconnect()
+                    except:
+                        pass
+            except:
+                pass
+
+            try:
+                if hasattr(self, 'region_viewbox') and self.region_viewbox is not None:
+                    try:
+                        self.region_viewbox.sigRangeChanged.disconnect()
+                    except:
+                        pass
+            except:
+                pass
+
+            # 4. メモリマップを先にクローズ（プロットデータより前に）
+            if hasattr(self, 'wv_loader') and self.wv_loader is not None:
+                try:
+                    self.wv_loader.close()
+                    self.wv_loader = None
+                except:
+                    pass
+
+            # 5. プロットデータをクリア（メモリマップへの参照を解放）
+            try:
+                if hasattr(self, 'overview_curve') and self.overview_curve is not None:
+                    self.overview_curve.setData([], [])
+                    self.overview_curve.clear()
+                    self.overview_curve = None
+            except:
+                pass
+
+            try:
+                if hasattr(self, 'region_curve') and self.region_curve is not None:
+                    self.region_curve.setData([], [])
+                    self.region_curve.clear()
+                    self.region_curve = None
+            except:
+                pass
+
+            try:
+                if hasattr(self, 'spectrogram_widget') and self.spectrogram_widget is not None:
+                    if hasattr(self.spectrogram_widget, 'img_item') and self.spectrogram_widget.img_item is not None:
+                        self.spectrogram_widget.img_item.clear()
+                        self.spectrogram_widget.img_item = None
+                    self.spectrogram_widget = None
+            except:
+                pass
+
+            # 6. PlotItems自体を削除
+            try:
+                if hasattr(self, 'overview') and self.overview is not None:
+                    self.overview.clear()
+                    self.overview = None
+            except:
+                pass
+
+            try:
+                if hasattr(self, 'region') and self.region is not None:
+                    if hasattr(self.region, 'lines'):
+                        for line in self.region.lines:
+                            try:
+                                line.setParentItem(None)
+                            except:
+                                pass
+                    self.region = None
+            except:
+                pass
+
+            # 5. ガベージコレクション
+            import gc
+            gc.collect()
+
+        except:
+            pass
+
+        # イベントを受け入れてウィンドウを閉じる
+        event.accept()
+
+
+def main():
+    """
+    メイン関数
+
+    Segmentation fault回避のため、適切なクリーンアップを実施する。
+    Cmd+Q（Ctrl+Q）でも安全に終了できるよう設計。
+    """
+    # Qtアプリケーション作成
+    app = QApplication(sys.argv)
+
+    # アプリケーション全体のフォントサイズをプラットフォーム別に設定
+    from PySide6.QtGui import QFont
+    app_font = QFont()
+    if sys.platform == 'win32':
+        app_font.setPointSize(9)  # Windows: 9ptに統一（コンパクト表示）
+    else:
+        app_font.setPointSize(20)  # macOS/Linux: 大きめ
+    app.setFont(app_font)
+
+    # ダークテーマ適用（利用可能な場合）
+    if HAS_DARKTHEME:
+        try:
+            app.setStyleSheet(qdarktheme.load_stylesheet())
+        except:
+            pass
+
+    # メインウィンドウ作成・表示
+    viewer = RSIQViewer()
+    viewer.show()
+
+    # 起動メッセージ
+    print("=" * 60)
+    print("Rohde & Schwarz IQ Data Viewer")
+    print("Target: Windows 11, Core i3, 8GB RAM")
+    print("Supported formats: WVH/WVD, iq.tar")
+    print("=" * 60)
+    print("アプリケーションが起動しました。")
+    print("左側のファイルブラウザからファイルをダブルクリックしてください。")
+
+    # アプリケーション実行
+    exit_code = app.exec()
+
+    # ========================================
+    # クリーンアップ（Cmd+Q対応）
+    # closeEventで既にクリーンアップされているため、
+    # ここでは最小限の処理のみ行う
+    # ========================================
+
+    # ガベージコレクション
+    import gc
+    gc.collect()
+
+    # 正常終了
+    sys.exit(exit_code)
+
+
+if __name__ == '__main__':
+    main()
