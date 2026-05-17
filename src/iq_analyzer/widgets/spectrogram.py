@@ -193,9 +193,19 @@ class SpectrogramWidget(QWidget):
         self.spectrogram_data = sxx_db
 
         sxx_display = self._maybe_downsample(sxx_db)
+        min_level, max_level = auto_color_levels(sxx_db)
 
+        # Pass levels alongside the image data so the very first paint uses
+        # the correct dynamic range. If we called setImage() and then setLevels()
+        # separately, Qt could (and would) repaint once in between with the
+        # stale levels from the previous capture, showing the spectrogram as
+        # a blank black field for a single frame.
         # PyQtGraph expects (x, y); our data is (freq, time) so we transpose.
-        self.img_item.setImage(sxx_display.T, autoLevels=False)
+        self.img_item.setImage(
+            sxx_display.T,
+            autoLevels=False,
+            levels=(min_level, max_level),
+        )
 
         if len(time_scale) > 1 and len(freq_mhz) > 1:
             rect = QRectF(
@@ -206,9 +216,8 @@ class SpectrogramWidget(QWidget):
             )
             self.img_item.setRect(rect)
 
-        min_level, max_level = auto_color_levels(sxx_db)
+        # Keep the histogram LUT in sync with the displayed levels.
         self.hist.setLevels(min_level, max_level)
-        self.img_item.setLevels([min_level, max_level])
         self.current_min_level = min_level
         self.current_max_level = max_level
         self.current_sxx_db = sxx_db

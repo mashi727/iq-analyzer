@@ -607,9 +607,9 @@ class RSIQViewer(QMainWindow):
                 f"Fs={self.sample_rate/1e6:.1f} MHz | Fc={self.center_frequency/1e6:.1f} MHz | {size_gb:.2f} GB"
             )
 
-            # Region初期化（中央50%）- 時間ベースで設定
-            initial_start = int(self.total_samples * 0.25)
-            initial_end = int(self.total_samples * 0.75)
+            # Region初期化（中央10%）- 時間ベースで設定
+            initial_start = int(self.total_samples * 0.45)
+            initial_end = int(self.total_samples * 0.55)
             initial_start_time = initial_start / self.sample_rate
             initial_end_time = initial_end / self.sample_rate
 
@@ -620,7 +620,7 @@ class RSIQViewer(QMainWindow):
 
             self.region_start = initial_start
             self.region_end = initial_end
-            print(f"Region初期化: {initial_start:,} ~ {initial_end:,} (中央50%, {initial_start_time:.6f}s ~ {initial_end_time:.6f}s)")
+            print(f"Region初期化: {initial_start:,} ~ {initial_end:,} (中央10%, {initial_start_time:.6f}s ~ {initial_end_time:.6f}s)")
 
             # フルスパン波形の表示（Min-Maxダウンサンプリング）
             print("フルスパン波形を表示中...")
