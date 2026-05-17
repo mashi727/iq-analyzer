@@ -1,4 +1,5 @@
-"""File-browser panel: a tree view of WVH / iq.tar files plus a header preview.
+"""File-browser panel: a tree view of WVH / iq.tar / Keysight .bin files plus
+a header preview.
 
 The panel is fully self-contained: it owns its model, view and preview text
 area. It communicates with the rest of the app exclusively through Qt signals,
@@ -20,7 +21,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from iq_analyzer.loaders import IQTarLoader, WVFileLoader
+from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, WVFileLoader
 
 
 def _format_duration(samples: int, clock_hz: float) -> str | None:
@@ -96,6 +97,41 @@ def _format_iqtar_header(file_path: Path, header: dict) -> str:
     return "\n".join(text)
 
 
+def _format_keysight_header(file_path: Path, header: dict) -> str:
+    text: list[str] = []
+    size_gb = file_path.stat().st_size / 1e9
+    text.append(f"binサイズ:        {size_gb:.2f} GB")
+    text.append(f"フォーマット:     {header.get('TYPE', 'Keysight N5110A')}")
+    text.append(f"コンポーネント:   {header.get('COMPONENTS', 'IQ')}")
+    text.append(f"分解能:           {header.get('RESOLUTION', 16)} bit\n")
+
+    samples = int(header.get("SAMPLES", 0))
+    clock = float(header.get("CLOCK", 0))
+    text.append(f"サンプル数:       {samples:,}")
+    text.append(f"サンプリング周波数: {clock / 1e6:.2f} MHz")
+    duration = _format_duration(samples, clock)
+    if duration:
+        text.append(f"継続時間:         {duration}\n")
+
+    frequency = float(header.get("FREQUENCY", 0))
+    text.append(f"中心周波数:       {frequency / 1e6:.2f} MHz")
+    if "FreqValidMin" in header and "FreqValidMax" in header:
+        fmin = float(header["FreqValidMin"]) / 1e6
+        fmax = float(header["FreqValidMax"]) / 1e6
+        text.append(f"有効周波数範囲:   {fmin:.2f} - {fmax:.2f} MHz")
+
+    yscale = header.get("YSCALE")
+    if yscale is not None:
+        text.append(f"\nYScale:           {float(yscale):.6e}")
+    if "InputRange" in header:
+        text.append(f"InputRange:       {header['InputRange']} V")
+    if "InputRefImped" in header:
+        text.append(f"参照インピーダンス: {header['InputRefImped']} Ω")
+    if "TimeUtcString" in header:
+        text.append(f"記録時刻:         {header['TimeUtcString']}")
+    return "\n".join(text)
+
+
 def _display_width(name: str) -> int:
     """Rough fixed-width column count: non-ASCII counts as 2, ASCII as 1."""
     return sum(2 if ord(c) > 127 else 1 for c in name)
@@ -143,7 +179,7 @@ class FileBrowserPanel(QWidget):
 
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath(str(self._current_root_dir))
-        self.file_model.setNameFilters(["*.wvh", "*.iq.tar"])
+        self.file_model.setNameFilters(["*.wvh", "*.iq.tar", "*.bin"])
         self.file_model.setNameFilterDisables(False)
         self.file_model.setFilter(QDir.AllDirs | QDir.Files | QDir.NoDot | QDir.NoDotDot)
 
@@ -231,23 +267,32 @@ class FileBrowserPanel(QWidget):
 
     @staticmethod
     def _is_iq_file(path: Path) -> bool:
-        return path.suffix in {".wvh", ".tar"} or path.name.endswith(".iq.tar")
+        if path.suffix in {".wvh", ".tar"} or path.name.endswith(".iq.tar"):
+            return True
+        # Keysight: .bin only counts if the matching .bin.txt sits next to it,
+        # otherwise we'd pick up arbitrary firmware blobs that happen to share
+        # the extension.
+        return path.suffix == ".bin" and path.with_suffix(".bin.txt").exists()
 
     def _show_header(self, file_path: Path) -> None:
         display_name = f"📄 {file_path.name}"
         rule = "=" * _display_width(display_name)
         try:
             if file_path.suffix == ".wvh":
-                loader = WVFileLoader()
-                header = loader.parse_wvh(str(file_path))
+                wv_loader = WVFileLoader()
+                header = wv_loader.parse_wvh(str(file_path))
                 body = _format_wvh_header(file_path, header)
             elif file_path.name.endswith(".iq.tar"):
-                loader = IQTarLoader()
-                header = loader.parse_iqtar(str(file_path))
+                tar_loader = IQTarLoader()
+                header = tar_loader.parse_iqtar(str(file_path))
                 try:
                     body = _format_iqtar_header(file_path, header)
                 finally:
-                    loader.close()
+                    tar_loader.close()
+            elif file_path.suffix == ".bin" and file_path.with_suffix(".bin.txt").exists():
+                ks_loader = KeysightBinLoader()
+                header = ks_loader.parse_bin_txt(file_path)
+                body = _format_keysight_header(file_path, header)
             else:
                 return
         except Exception as exc:

@@ -40,7 +40,7 @@ from iq_analyzer.core import (
     memory_status,
     min_max_downsample,
 )
-from iq_analyzer.loaders import IQTarLoader, WVFileLoader
+from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, WVFileLoader
 from iq_analyzer.widgets import (
     AdjustmentPanel,
     ControlPanel,
@@ -66,8 +66,8 @@ class RSIQViewer(QMainWindow):
 
     def __init__(self):
         super().__init__()
-        self.wv_loader = None  # WVFileLoader or IQTarLoader
-        self.file_type = None  # 'wv' or 'iqtar'
+        self.wv_loader = None  # WVFileLoader, IQTarLoader, or KeysightBinLoader
+        self.file_type = None  # 'wv', 'iqtar', or 'keysight'
         self.total_samples = 0
         self.sample_rate = 1.0
         self.center_frequency = 0
@@ -570,6 +570,21 @@ class RSIQViewer(QMainWindow):
                 fname = file_path_obj.name
                 size_gb = self.wv_loader.wvd_path.stat().st_size / 1e9
                 print(f"WVDサイズ: {size_gb:.2f} GB")
+            elif file_path_obj.suffix == '.bin' and file_path_obj.with_suffix('.bin.txt').exists():
+                # Keysight N5110A .bin
+                print("形式: Keysight N5110A (.bin + .bin.txt)")
+                self.file_type = 'keysight'
+                self.wv_loader = KeysightBinLoader()
+
+                print("Keysight メタデータを解析中...")
+                header = self.wv_loader.parse_bin_txt(file_path)
+
+                print("binファイルをメモリマップで開いています...")
+                self.wv_loader.open_bin()
+
+                fname = file_path_obj.name
+                size_gb = file_path_obj.stat().st_size / 1e9
+                print(f"binサイズ: {size_gb:.2f} GB")
             else:
                 raise ValueError(f"未対応のファイル形式: {file_path_obj.suffix}")
 
@@ -583,8 +598,8 @@ class RSIQViewer(QMainWindow):
             print(f"中心周波数: {self.center_frequency/1e6:.2f} MHz")
 
             # パンくずリストを読み込んだファイルのディレクトリに更新
-            file_dir = Path(fname).parent
-            self.update_breadcrumb(file_dir)
+            file_dir = file_path_obj.parent
+            self.control_panel.set_breadcrumb_path(file_dir)
 
             # ステータスバーに読み込み完了を表示（詳細情報含む）
             self.status_label.setText(
@@ -1455,6 +1470,8 @@ class RSIQViewer(QMainWindow):
             default_name = self.wv_loader.wvh_path.stem + f"_region_{self.region_start}_{self.region_end}"
         elif self.file_type == 'iqtar' and hasattr(self.wv_loader, 'tar_path') and self.wv_loader.tar_path:
             default_name = self.wv_loader.tar_path.stem + f"_region_{self.region_start}_{self.region_end}"
+        elif self.file_type == 'keysight' and hasattr(self.wv_loader, 'bin_path') and self.wv_loader.bin_path:
+            default_name = self.wv_loader.bin_path.stem + f"_region_{self.region_start}_{self.region_end}"
         else:
             default_name = f"region_{self.region_start}_{self.region_end}"
 
@@ -1488,13 +1505,11 @@ class RSIQViewer(QMainWindow):
             print(f"データ読み込み完了: {len(iq_data):,} samples")
 
             # IQデータをint16形式に変換（WVH/WVD形式はRAW16LE）
-            # iq.tarの場合はfloat32なので、適切にスケーリングが必要
-            if self.file_type == 'iqtar':
-                # float32 -> int16 変換
-                # 正規化してint16の範囲にマッピング
+            # iq.tar (float32) と Keysight (float32 × YScale) はどちらも実数振幅
+            # なので、int16 のフルスケールに合わせて再正規化が必要。
+            if self.file_type in ('iqtar', 'keysight'):
                 max_val = np.max(np.abs(iq_data))
                 if max_val > 0:
-                    # int16の最大値（32767）でスケーリング
                     scale_factor = 32767.0 / max_val
                     iq_data_scaled = iq_data * scale_factor
                 else:
@@ -1508,7 +1523,7 @@ class RSIQViewer(QMainWindow):
             header_template = self.wv_loader.header.copy()
 
             # WVH/WVD形式に必要なフィールドを追加/上書き
-            if self.file_type == 'iqtar':
+            if self.file_type in ('iqtar', 'keysight'):
                 header_template['TYPE'] = 'RAW16LE'
                 header_template['COMPONENTS'] = 'IQ'
                 header_template['RESOLUTION'] = 16
