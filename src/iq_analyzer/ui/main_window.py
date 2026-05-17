@@ -9,6 +9,7 @@ already been pulled out into :mod:`iq_analyzer.core` and
 
 from __future__ import annotations
 
+import contextlib
 import sys
 from pathlib import Path
 
@@ -410,10 +411,8 @@ class RSIQViewer(QMainWindow):
             # 1. プロットデータをクリア
             # ========================================
             if hasattr(self, 'overview_curve') and self.overview_curve is not None:
-                try:
+                with contextlib.suppress(Exception):
                     self.overview_curve.setData([], [])
-                except:
-                    pass
 
             # 下段Overview波形プロットをリセット（Regionは保持）
             if hasattr(self, 'overview_plot') and self.overview_plot is not None:
@@ -429,23 +428,19 @@ class RSIQViewer(QMainWindow):
 
                     # Regionを再作成（clear()で削除されるため）
                     if hasattr(self, 'region') and self.region is not None:
-                        try:
+                        with contextlib.suppress(Exception):
                             self.overview_plot.removeItem(self.region)
-                        except:
-                            pass
                     # 新しいRegionを作成（初期位置は後で設定）
                     self.region = pg.LinearRegionItem(values=(0, 1), movable=True)
                     self.region.sigRegionChanged.connect(self.on_region_changed)
                     self.region.sigRegionChangeFinished.connect(self.on_region_change_finished)
                     self.overview_plot.addItem(self.region)
-                except:
+                except Exception:
                     pass
 
             if hasattr(self, 'region_curve') and self.region_curve is not None:
-                try:
+                with contextlib.suppress(Exception):
                     self.region_curve.setData([], [])
-                except:
-                    pass
 
             # 中段Region波形プロットをリセット
             if hasattr(self, 'region_plot') and self.region_plot is not None:
@@ -458,7 +453,7 @@ class RSIQViewer(QMainWindow):
                     self.region_plot.setLabel('left', '振幅')
                     # プロットカーブを再作成
                     self.region_curve = self.region_plot.plot(pen=pg.mkPen('c', width=1))
-                except:
+                except Exception:
                     pass
 
             if hasattr(self, 'spectrogram_widget') and self.spectrogram_widget is not None:
@@ -469,19 +464,15 @@ class RSIQViewer(QMainWindow):
                 self.spectrogram_widget.time_unit = None
                 # ImageItemのデータのみクリア（ウィジェット自体は削除しない）
                 if hasattr(self.spectrogram_widget, 'img_item') and self.spectrogram_widget.img_item is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         # 空のデータでImageを更新（ImageItem自体は保持）
                         import numpy as np
                         empty_data = np.zeros((1, 1))
                         self.spectrogram_widget.img_item.setImage(empty_data)
-                    except:
-                        pass
                 # 軸ラベルをリセット
-                try:
+                with contextlib.suppress(Exception):
                     self.spectrogram_widget.plot_item.setLabel('bottom', '時間')
                     self.spectrogram_widget.plot_item.setLabel('left', '周波数', units='MHz')
-                except:
-                    pass
 
             # ========================================
             # 2. Qtイベント処理
@@ -492,10 +483,8 @@ class RSIQViewer(QMainWindow):
             # 3. メモリマップをクローズ
             # ========================================
             if hasattr(self, 'wv_loader') and self.wv_loader is not None:
-                try:
+                with contextlib.suppress(Exception):
                     self.wv_loader.close()
-                except Exception as e:
-                    pass  # エラーは無視して続行
 
             # ========================================
             # 4. 内部状態をリセット
@@ -513,7 +502,7 @@ class RSIQViewer(QMainWindow):
             gc.collect()
 
 
-        except Exception as e:
+        except Exception:
             pass  # エラーは無視して続行
 
     def load_file(self, file_path):
@@ -546,7 +535,7 @@ class RSIQViewer(QMainWindow):
             file_path_obj = Path(file_path)
             if file_path_obj.suffix == '.tar' or file_path.endswith('.iq.tar'):
                 # iq.tarファイル
-                print(f"形式: iq.tar")
+                print("形式: iq.tar")
                 self.file_type = 'iqtar'
                 self.wv_loader = IQTarLoader()
 
@@ -565,7 +554,7 @@ class RSIQViewer(QMainWindow):
 
             elif file_path_obj.suffix == '.wvh':
                 # WVHファイル
-                print(f"形式: WVH/WVD")
+                print("形式: WVH/WVD")
                 self.file_type = 'wv'
                 self.wv_loader = WVFileLoader()
 
@@ -752,7 +741,7 @@ class RSIQViewer(QMainWindow):
 
             # 標準出力に情報を表示
             print("-" * 60)
-            print(f"[Region変更]")
+            print("[Region変更]")
             print(f"  範囲: {self.region_start:,} ~ {self.region_end:,}")
             print(f"  サンプル数: {samples:,}")
             print(f"  継続時間: {duration_str}")
@@ -927,11 +916,11 @@ class RSIQViewer(QMainWindow):
 
             print(f"フルスパン波形表示完了 ({len(x_data):,} points)")
 
-        except (MemoryError, np.core._exceptions._ArrayMemoryError) as e:
+        except (MemoryError, np.core._exceptions._ArrayMemoryError):
             # メモリ不足エラーの場合、ユーザーに通知して続行
-            print(f"[ERROR] メモリ不足のため、フルスパン波形の表示をスキップします")
+            print("[ERROR] メモリ不足のため、フルスパン波形の表示をスキップします")
             print(f"  ファイルサイズが大きすぎます: {self.total_samples:,} samples")
-            print(f"  解決策: より小さなRegion範囲を選択してください")
+            print("  解決策: より小さなRegion範囲を選択してください")
             # プレースホルダーとして空のプロットを表示
             self.overview_curve.setData([], [])
         except Exception as e:
@@ -1119,7 +1108,6 @@ class RSIQViewer(QMainWindow):
                 return
 
             # ViewBoxのピクセル幅を取得
-            view_rect = self.overview_viewbox.viewRect()
             widget_rect = self.overview_plot.rect()
 
             # ピクセル幅を推定（ウィジェット幅の80%程度）
@@ -1332,7 +1320,7 @@ class RSIQViewer(QMainWindow):
             # メモリ使用量をログに出力（警告ダイアログは表示しない）
             if total_estimated_mb > 2000:
                 print(f"[メモリ使用量] 推定 {total_estimated_mb/1024:.2f} GB（大容量処理）")
-                print(f"  8GB RAM環境では処理に時間がかかる可能性があります")
+                print("  8GB RAM環境では処理に時間がかかる可能性があります")
                 # ダイアログなしで処理を続行
 
             # 計算中の表示と操作制限
@@ -1372,7 +1360,7 @@ class RSIQViewer(QMainWindow):
                 progress=_report,
             )
 
-            print(f"計算完了")
+            print("計算完了")
             print(f"  スペクトログラム形状: {sxx_db.shape}")
             print(f"  周波数ビン数: {len(frequencies)}")
             print(f"  時間フレーム数: {len(times)}")
@@ -1533,7 +1521,7 @@ class RSIQViewer(QMainWindow):
             )
 
             wvd_size_mb = wvd_path.stat().st_size / 1e6
-            print(f"保存完了:")
+            print("保存完了:")
             print(f"  WVHファイル: {wvh_path.name}")
             print(f"  WVDファイル: {wvd_path.name} ({wvd_size_mb:.2f} MB)")
             print("=" * 60)
@@ -1609,9 +1597,12 @@ class RSIQViewer(QMainWindow):
     def _on_auto_update_toggled(self, enabled):
         """AdjustmentPanel.auto_update_changed (bool) ハンドラ。"""
         self.auto_update_spectrogram = bool(enabled)
-        if self.auto_update_spectrogram:
-            if self.total_samples > 0 and self.region_start < self.region_end:
-                self.calculate_spectrogram()
+        if (
+            self.auto_update_spectrogram
+            and self.total_samples > 0
+            and self.region_start < self.region_end
+        ):
+            self.calculate_spectrogram()
         # ステータス再描画
         self.on_region_changed()
 
@@ -1654,7 +1645,7 @@ class RSIQViewer(QMainWindow):
             # ただし終了処理中は呼ばない
             if not self.is_closing:
                 QCoreApplication.processEvents()
-        except:
+        except Exception:
             # 終了処理中にオブジェクトが削除されている場合は無視
             pass
 
@@ -1677,7 +1668,6 @@ class RSIQViewer(QMainWindow):
         # 不整合の詳細情報
         actual_samples = self.wv_loader.header['SAMPLES']
         wvh_path = self.wv_loader.wvh_path
-        wvd_path = self.wv_loader.wvd_path
 
         message = (
             f"WVHヘッダーとWVDファイルサイズに不整合が検出されました。\n\n"
@@ -1745,109 +1735,79 @@ class RSIQViewer(QMainWindow):
 
             # 1. 標準出力のシグナル接続を最初に切断（最重要！）
             if hasattr(self, 'stdout_redirector') and self.stdout_redirector:
-                try:
+                with contextlib.suppress(Exception):
                     # シグナル接続を切断
                     self.stdout_redirector.text_written.disconnect()
-                except:
-                    pass
-                try:
+                with contextlib.suppress(Exception):
                     # 標準出力を元に戻す
                     sys.stdout = self.stdout_redirector.original_stdout
                     self.stdout_redirector = None
-                except:
-                    pass
 
             # 2. メモリ更新タイマーを停止
             if hasattr(self, 'memory_timer') and self.memory_timer:
-                try:
+                with contextlib.suppress(Exception):
                     self.memory_timer.stop()
                     self.memory_timer.deleteLater()
                     self.memory_timer = None
-                except:
-                    pass
 
             # 3. すべてのシグナル接続を切断
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'region') and self.region is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self.region.sigRegionChanged.disconnect()
-                    except:
-                        pass
-                    try:
+                    with contextlib.suppress(Exception):
                         self.region.sigRegionChangeFinished.disconnect()
-                    except:
-                        pass
-            except:
-                pass
 
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'region_viewbox') and self.region_viewbox is not None:
-                    try:
+                    with contextlib.suppress(Exception):
                         self.region_viewbox.sigRangeChanged.disconnect()
-                    except:
-                        pass
-            except:
-                pass
 
             # 4. メモリマップを先にクローズ（プロットデータより前に）
             if hasattr(self, 'wv_loader') and self.wv_loader is not None:
-                try:
+                with contextlib.suppress(Exception):
                     self.wv_loader.close()
                     self.wv_loader = None
-                except:
-                    pass
 
             # 5. プロットデータをクリア（メモリマップへの参照を解放）
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'overview_curve') and self.overview_curve is not None:
                     self.overview_curve.setData([], [])
                     self.overview_curve.clear()
                     self.overview_curve = None
-            except:
-                pass
 
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'region_curve') and self.region_curve is not None:
                     self.region_curve.setData([], [])
                     self.region_curve.clear()
                     self.region_curve = None
-            except:
-                pass
 
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'spectrogram_widget') and self.spectrogram_widget is not None:
                     if hasattr(self.spectrogram_widget, 'img_item') and self.spectrogram_widget.img_item is not None:
                         self.spectrogram_widget.img_item.clear()
                         self.spectrogram_widget.img_item = None
                     self.spectrogram_widget = None
-            except:
-                pass
 
             # 6. PlotItems自体を削除
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'overview') and self.overview is not None:
                     self.overview.clear()
                     self.overview = None
-            except:
-                pass
 
-            try:
+            with contextlib.suppress(Exception):
                 if hasattr(self, 'region') and self.region is not None:
                     if hasattr(self.region, 'lines'):
                         for line in self.region.lines:
-                            try:
+                            with contextlib.suppress(Exception):
                                 line.setParentItem(None)
-                            except:
-                                pass
                     self.region = None
-            except:
-                pass
 
             # 5. ガベージコレクション
             import gc
             gc.collect()
 
-        except:
+        except Exception:
             pass
 
         # イベントを受け入れてウィンドウを閉じる
