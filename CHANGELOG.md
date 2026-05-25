@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1] — 2026-05-26
+
+### Fixed
+
+- `pyqtdarktheme` is now an optional `[darktheme]` extra instead of a hard
+  dependency. Its only PyPI release (2.1.0) pins `Requires-Python <3.12`, so
+  `pip install iq-analyzer` failed on Python 3.12/3.13 even though the dark
+  theme is purely cosmetic and already imported behind a try/except. Core
+  installs now have no Python-version-gated dependencies.
+
 ## [0.1.0] — 2026-05-17
 
 First public release. The project started life as a single-file
@@ -57,5 +67,6 @@ src-layout package with full test coverage.
   / `contextlib.suppress(Exception)` so Ctrl+C / SystemExit are no longer
   swallowed during teardown.
 
-[Unreleased]: https://github.com/mashi727/iq-analyzer/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/mashi727/iq-analyzer/compare/v0.1.1...HEAD
+[0.1.1]: https://github.com/mashi727/iq-analyzer/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/mashi727/iq-analyzer/releases/tag/v0.1.0
