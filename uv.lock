@@ -142,7 +142,6 @@ source = { editable = "." }
 dependencies = [
     { name = "numpy" },
     { name = "psutil" },
-    { name = "pyqtdarktheme" },
     { name = "pyqtgraph" },
     { name = "pyside6" },
     { name = "scipy" },
@@ -151,6 +150,9 @@ dependencies = [
 [package.optional-dependencies]
 build = [
     { name = "pyinstaller" },
+]
+darktheme = [
+    { name = "pyqtdarktheme", marker = "python_full_version < '3.12'" },
 ]
 
 [package.dev-dependencies]
@@ -166,12 +168,12 @@ requires-dist = [
     { name = "numpy", specifier = ">=1.26" },
     { name = "psutil", specifier = ">=5.9" },
     { name = "pyinstaller", marker = "extra == 'build'", specifier = ">=6.3" },
-    { name = "pyqtdarktheme", specifier = ">=2.1" },
+    { name = "pyqtdarktheme", marker = "python_full_version < '3.12' and extra == 'darktheme'", specifier = ">=2.1" },
     { name = "pyqtgraph", specifier = ">=0.13" },
     { name = "pyside6", specifier = ">=6.6" },
     { name = "scipy", specifier = ">=1.11" },
 ]
-provides-extras = ["build"]
+provides-extras = ["build", "darktheme"]
 
 [package.metadata.requires-dev]
 dev = [

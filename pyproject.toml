@@ -29,12 +29,17 @@ dependencies = [
     "numpy>=1.26",
     "scipy>=1.11",
     "psutil>=5.9",
-    "pyqtdarktheme>=2.1",
 ]
 
 [project.optional-dependencies]
 build = [
     "pyinstaller>=6.3",
+]
+# pyqtdarktheme's PyPI release pins Requires-Python <3.12, so installs fail
+# under modern Python. cli.py already imports it inside try/except, so we keep
+# it as an opt-in extra for users on supported Python versions.
+darktheme = [
+    "pyqtdarktheme>=2.1; python_version < '3.12'",
 ]
 
 [project.urls]
