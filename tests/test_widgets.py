@@ -190,3 +190,19 @@ def test_adjustment_panel_lists_every_known_colormap(qapp, name) -> None:
     panel = AdjustmentPanel()
     items = [panel.colormap_combo.itemText(i) for i in range(panel.colormap_combo.count())]
     assert name in items
+
+
+def test_file_browser_volume_selector(qapp, tmp_path) -> None:
+    from iq_analyzer.widgets.file_browser import FileBrowserPanel, mounted_volumes
+
+    for label, root in mounted_volumes():
+        assert label and root.exists()
+
+    panel = FileBrowserPanel()
+    combo = panel.volume_combo
+    targets = [combo.itemData(i) for i in range(combo.count())]
+    assert targets[0] is None  # placeholder
+    home_index = targets.index(str(__import__("pathlib").Path.home()))
+    combo.activated.emit(home_index)
+    assert panel.current_root_dir == __import__("pathlib").Path.home()
+    assert combo.currentIndex() == 0

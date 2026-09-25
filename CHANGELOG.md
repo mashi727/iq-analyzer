@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Rohde & Schwarz ARB waveform files (`.wv`, `{TYPE: SMU-WV}`) via the new
+  `SMUWVLoader`. The single-file layout (ASCII tags + `{WAVEFORM-n:#...}` int16
+  payload) is memory-mapped at the payload offset. Both `WAVEFORM` and
+  `WWAVEFORM` tags are accepted; when the `SAMPLES` tag disagrees with the
+  payload length, the payload length wins.
+- Precomputed amplitude envelope (`core.envelope`) for very large files: one
+  background pass stores min/max amplitude per 4096 samples (~49 MB for
+  100 GB) in the per-user cache directory (never next to the data). Overview
+  and zoomed waveforms are then served from it in milliseconds, with every
+  sample contributing. Measured on a 17 GB file: first open shows a preview in
+  1.5 s and the envelope completes in ~8 s; reopening takes ~0.2 s.
+- Streaming spectrogram (`compute_spectrogram_streaming`): the region is read
+  and transformed in batches, and frames beyond 4096 columns are max-pooled in
+  time, so memory no longer grows with region length.
+- Storage selector in the file browser listing mounted volumes (`/Volumes/*`
+  on macOS, drives on Windows, `/media` `/mnt` on Linux), refreshed each time
+  it opens. `/Volumes` is a hidden directory on macOS, so external drives were
+  previously unreachable from the tree.
+- The output panel now also shows `sys.stderr` (tracebacks, Python warnings)
+  and `iq_analyzer` log records at WARNING and above, in red. Previously only
+  stdout was captured, so failures such as an envelope-cache write error were
+  invisible — and lost entirely in the `--windowed` EXE, where `sys.stderr` is
+  `None`. Qt's own C++ warnings are intentionally not routed (they are emitted
+  mid-paint, and echoing them would re-enter the event loop).
+- Payloads whose byte entropy is indistinguishable from uniform random data
+  (> 7.99 bit/byte, typical of encrypted waveforms) trigger a warning dialog,
+  because the displayed waveform would not represent the recorded signal.
+
+### Changed
+
+- The initial region is the central 10% capped at 2^28 samples (1 GB of int16),
+  so the first spectrogram of a 100 GB file no longer takes minutes.
+
+### Fixed
+
+- Overview decimation read the *whole* file on every full-span redraw: its
+  "sub-sampling" branch read each bin in full before sub-sampling. Wide ranges
+  without an envelope now use a bounded preview (≤ 512 reads of 64 Ki samples).
+- Intermittent segfault: `print()` → `append_stdout` → `processEvents()` could
+  re-enter the event loop from inside a repaint. Re-entry is now guarded.
+- Spectrogram rendered as a single flat colour on recordings with recurring
+  strong bursts. Three compounding causes: the auto colour range used
+  `max - 30 dB` as its lower bound, which rose above the whole noise floor when
+  bursts were frequent (now capped at the median); max-pool downsampling read
+  the viewport size in data units (s × MHz) instead of pixels, so it never ran
+  and short bursts were dropped by the painter; and levels were computed on the
+  raw STFT rather than the pooled image actually shown.
+
 ## [0.1.1] — 2026-05-26
 
 ### Fixed

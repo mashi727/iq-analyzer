@@ -1,8 +1,8 @@
 """IQ file format loaders.
 
 Use :func:`open_iq_file` to load an IQ recording without caring whether it is
-stored as a Rohde & Schwarz WVH/WVD pair, a modern ``iq.tar`` archive, or a
-Keysight N5110A ``.bin`` + ``.bin.txt`` pair.
+stored as a Rohde & Schwarz WVH/WVD pair, an ARB ``.wv`` waveform, a modern
+``iq.tar`` archive, or a Keysight N5110A ``.bin`` + ``.bin.txt`` pair.
 """
 
 from __future__ import annotations
@@ -12,12 +12,14 @@ from pathlib import Path
 from iq_analyzer.loaders.base import IQLoader
 from iq_analyzer.loaders.iqtar import IQTarLoader
 from iq_analyzer.loaders.keysight import KeysightBinLoader
+from iq_analyzer.loaders.smuwv import SMUWVLoader
 from iq_analyzer.loaders.wv import WVFileLoader
 
 __all__ = [
     "IQLoader",
     "IQTarLoader",
     "KeysightBinLoader",
+    "SMUWVLoader",
     "WVFileLoader",
     "open_iq_file",
 ]
@@ -30,6 +32,7 @@ def open_iq_file(path: str | Path) -> IQLoader:
 
     * ``.wvh`` / ``.wvd`` — :class:`WVFileLoader` (parses the ``.wvh`` and
       memory-maps the ``.wvd``).
+    * ``.wv`` — :class:`SMUWVLoader` (single-file R&S ARB waveform).
     * ``.iq.tar`` (or just ``.tar``) — :class:`IQTarLoader`.
     * ``.bin`` accompanied by ``<name>.bin.txt`` — :class:`KeysightBinLoader`.
     """
@@ -47,6 +50,12 @@ def open_iq_file(path: str | Path) -> IQLoader:
         wv_loader.parse_wvh(path.with_suffix(".wvh"))
         wv_loader.open_wvd()
         return wv_loader
+
+    if path.suffix.lower() == ".wv":
+        smu_loader = SMUWVLoader()
+        smu_loader.parse_wv(path)
+        smu_loader.open_wv()
+        return smu_loader
 
     if path.suffix.lower() == ".bin" and path.with_suffix(".bin.txt").exists():
         ks_loader = KeysightBinLoader()

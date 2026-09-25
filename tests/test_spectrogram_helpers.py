@@ -94,3 +94,21 @@ def test_auto_color_levels_enforces_minimum_range() -> None:
 def test_available_colormaps_constant() -> None:
     assert "plasma" in AVAILABLE_COLORMAPS
     assert set(AVAILABLE_COLORMAPS) == {"plasma", "viridis", "inferno", "magma"}
+
+
+def test_auto_color_levels_recurring_bursts_keep_floor_visible() -> None:
+    """Frequent strong bursts must not push the lower bound above the floor.
+
+    Regression: a sky recording with RFI bursts in ~1-2% of frames gave
+    ``max - 30 dB`` above the 99th percentile, so the whole noise floor was
+    below the colormap and the spectrogram rendered as one flat colour.
+    """
+    rng = np.random.default_rng(3)
+    data = rng.normal(loc=86.0, scale=2.0, size=(256, 2000)).astype(np.float32)
+    data[:, ::60] += 50.0  # bursts in ~1.7% of frames, ~50 dB above the floor
+
+    lower, upper = auto_color_levels(data)
+    floor = float(np.median(data))
+    assert lower <= floor < upper
+    # Bursts sit above the range (saturate) instead of the floor sitting below it.
+    assert float(np.percentile(data, 1)) < upper < float(data.max())

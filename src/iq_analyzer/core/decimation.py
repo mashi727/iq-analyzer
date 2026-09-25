@@ -21,9 +21,15 @@ logger = logging.getLogger(__name__)
 # true waveform when possible.
 RAW_WAVEFORM_THRESHOLD = 3_200_000
 
-# When a single Min-Max bin would span more than this many samples, fall back
-# to ``linspace`` sub-sampling to keep memory bounded.
+# When a single Min-Max bin would span more than this many samples, reading
+# it whole is too slow (a 100 GB overview would read the entire file). Such
+# requests become a *preview*: at most ``PREVIEW_MAX_READS`` bins, each fed by
+# one contiguous ``PREVIEW_BLOCK`` read at the bin centre. The cap keeps the
+# seek count tolerable on external HDDs (~512 × 10 ms). A preview can miss
+# short pulses; the precomputed envelope (core.envelope) replaces it.
 _CHUNK_SIZE = 1_000_000
+PREVIEW_MAX_READS = 512
+PREVIEW_BLOCK = 65_536
 
 
 IQGetter = Callable[[int, int], NDArray[np.complexfloating]]
@@ -73,6 +79,9 @@ def min_max_downsample(
         "min-max decimation: %d samples -> %d target pixels", total_samples, target_pixels
     )
 
+    if total_samples // max(1, target_pixels) > _CHUNK_SIZE:
+        return _preview_downsample(get_iq_data, start_sample, end_sample, target_pixels, sample_rate)
+
     bin_size = max(1, total_samples // target_pixels)
     x_mins: list[float] = []
     x_maxs: list[float] = []
@@ -86,19 +95,7 @@ def min_max_downsample(
         if bin_end <= bin_start:
             break
 
-        if bin_end - bin_start > _CHUNK_SIZE:
-            sample_indices = np.linspace(
-                bin_start,
-                bin_end - 1,
-                min(_CHUNK_SIZE, bin_end - bin_start),
-                dtype=np.int64,
-            )
-            chunk_start = int(sample_indices[0])
-            chunk_end = int(sample_indices[-1]) + 1
-            chunk_data = get_iq_data(chunk_start, chunk_end)
-            iq_bin_data = chunk_data[sample_indices - chunk_start]
-        else:
-            iq_bin_data = get_iq_data(bin_start, bin_end)
+        iq_bin_data = get_iq_data(bin_start, bin_end)
 
         amplitudes = np.abs(iq_bin_data)
         bin_center = (bin_start + bin_end) / 2 / sample_rate
@@ -116,4 +113,29 @@ def min_max_downsample(
     x_data[1::2] = x_maxs
     y_data[0::2] = y_mins
     y_data[1::2] = y_maxs
+    return x_data, y_data
+
+
+def _preview_downsample(
+    get_iq_data: IQGetter,
+    start_sample: int,
+    end_sample: int,
+    target_pixels: int,
+    sample_rate: float,
+) -> tuple[NDArray[np.float64], NDArray[np.float32]]:
+    """Sparse min/max preview: one short contiguous read per output bin."""
+    total_samples = end_sample - start_sample
+    n_bins = max(1, min(target_pixels, PREVIEW_MAX_READS))
+    edges = start_sample + (np.arange(n_bins + 1, dtype=np.int64) * total_samples) // n_bins
+    block = min(PREVIEW_BLOCK, total_samples // n_bins)
+
+    x_data = np.empty(2 * n_bins, dtype=np.float64)
+    y_data = np.empty(2 * n_bins, dtype=np.float32)
+    for i in range(n_bins):
+        center = (int(edges[i]) + int(edges[i + 1])) // 2
+        s = max(start_sample, center - block // 2)
+        amplitudes = np.abs(get_iq_data(s, min(end_sample, s + block)))
+        x_data[2 * i : 2 * i + 2] = center / sample_rate
+        y_data[2 * i] = amplitudes.min()
+        y_data[2 * i + 1] = amplitudes.max()
     return x_data, y_data

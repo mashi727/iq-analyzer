@@ -14,6 +14,8 @@ hardware (Windows 11, Core i3, 8 GB RAM) without ever loading the file into RAM.
   ファイルでも RSS 2.5 GB 程度に収まる
 - **3 フォーマット対応** — 同じ UI から透過的に開ける
   - Rohde & Schwarz **WVH / WVD** (RAW16LE)
+  - Rohde & Schwarz **ARB 波形 `.wv`** (SMU-WV, int16 LE の単一ファイル。
+    暗号化などでIQとして解釈できないデータは統計的に検出して警告)
   - Rohde & Schwarz **iq.tar** (float32 / float64)
   - Keysight **N5110A `.bin` + `.bin.txt`** (16-bit LE + YScale 自動適用)
 - **3 ペイン同期 UI**
@@ -24,6 +26,8 @@ hardware (Windows 11, Core i3, 8 GB RAM) without ever loading the file into RAM.
   自動選択。8 GB マシン向けにメモリ予算 (~4 GB) で頭打ち
 - **Min-Max エンベロープ デシメーション** — 全体波形プロットでパルス信号の
   ピークを保持
+- **大容量ファイルの高速表示** — 初回のみ振幅エンベロープをバックグラウンドで計算し
+  ユーザーのキャッシュフォルダへ保存（100 GB で約 49 MB）。2 回目以降は全体波形が即時表示
 - **WVH/WVD 形式での書き出し** — Region 範囲をいつでも切り出せる (iq.tar /
   Keysight からの変換も対応)
 
@@ -66,7 +70,7 @@ uv run iq-analyzer
 ## 使い方
 
 1. 左ペインのファイルブラウザから IQ ファイルをダブルクリックで開く
-   (`.wvh`, `.iq.tar`, または `.bin.txt` を伴う `.bin`)
+   (`.wvh`, `.wv`, `.iq.tar`, または `.bin.txt` を伴う `.bin`)。外部ストレージはファイルブラウザ上部の「ストレージを選択…」から開けます
 2. 下段の Overview で青い線形 Region をドラッグして関心範囲を選択
 3. **📊 スペクトログラム計算** ボタン (or 「Region 変更時に自動更新」 ON) で
    2D スペクトログラムを描画
@@ -94,6 +98,7 @@ src/iq_analyzer/
 ├── loaders/
 │   ├── base.py            # IQLoader Protocol
 │   ├── wv.py              # R&S WVH/WVD
+│   ├── smuwv.py           # R&S ARB 波形 .wv (SMU-WV)
 │   ├── iqtar.py           # R&S iq.tar
 │   └── keysight.py        # Keysight N5110A .bin
 ├── widgets/

@@ -8,10 +8,12 @@ so the main window doesn't need to reach inside it.
 
 from __future__ import annotations
 
+import sys
 from pathlib import Path
 
-from PySide6.QtCore import QDir, Qt, Signal
+from PySide6.QtCore import QDir, QStorageInfo, Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
     QFileSystemModel,
     QGroupBox,
     QLabel,
@@ -21,7 +23,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, WVFileLoader
+from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, SMUWVLoader, WVFileLoader
 
 
 def _format_duration(samples: int, clock_hz: float) -> str | None:
@@ -67,6 +69,36 @@ def _format_wvh_header(file_path: Path, header: dict) -> str:
         if key in header:
             text.append(f"{label}:             {header[key]}")
 
+    return "\n".join(text)
+
+
+def _format_smuwv_header(file_path: Path, header: dict) -> str:
+    text: list[str] = []
+    size_gb = file_path.stat().st_size / 1e9
+    text.append(f"ファイルサイズ:   {size_gb:.2f} GB")
+    text.append(f"フォーマット:     {header.get('TYPE', 'SMU-WV')} (int16 IQ)")
+    if "COMMENT" in header:
+        text.append(f"コメント:         {header['COMMENT']}")
+    text.append("")
+
+    samples = int(header.get("SAMPLES", 0))
+    clock = float(header.get("CLOCK", 0))
+    text.append(f"サンプル数:       {samples:,}")
+    declared = header.get("SAMPLES_DECLARED")
+    if declared is not None and declared != samples:
+        text.append(f"  (SAMPLESタグ:   {declared:,})")
+    text.append(f"サンプリング周波数: {clock / 1e6:.2f} MHz")
+    duration = _format_duration(samples, clock)
+    if duration:
+        text.append(f"継続時間:         {duration}\n")
+
+    frequency = float(header.get("FREQUENCY", 0))
+    text.append(f"中心周波数:       {frequency / 1e6:.2f} MHz")
+    if "RMS_OFFSET_DB" in header:
+        text.append(f"レベルオフセット: RMS {header['RMS_OFFSET_DB']:.4f} dB / "
+                    f"Peak {header['PEAK_OFFSET_DB']:.4f} dB")
+    if "DATE" in header:
+        text.append(f"日付:             {header['DATE']}")
     return "\n".join(text)
 
 
@@ -132,6 +164,50 @@ def _format_keysight_header(file_path: Path, header: dict) -> str:
     return "\n".join(text)
 
 
+# macOS keeps system snapshots / helper volumes under /Volumes as well.
+_HIDDEN_VOLUME_NAMES = {"Recovery", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware"}
+
+
+def mounted_volumes() -> list[tuple[str, Path]]:
+    """Mounted, readable storage the user may want to browse: ``[(label, root)]``.
+
+    On macOS, ``/Volumes`` carries the hidden flag, so a :class:`QFileSystemModel`
+    without ``QDir.Hidden`` never lists it and external drives were unreachable
+    from the tree. This list gives them a direct entry point instead.
+    """
+    volumes: list[tuple[str, Path]] = []
+    for info in QStorageInfo.mountedVolumes():
+        if not (info.isValid() and info.isReady()):
+            continue
+        root = Path(info.rootPath())
+        if sys.platform == "darwin":
+            if root.parent != Path("/Volumes") or root.name in _HIDDEN_VOLUME_NAMES:
+                continue
+        elif sys.platform != "win32":
+            if not str(root).startswith(("/media/", "/mnt/", "/run/media/")):
+                continue
+        name = info.displayName() or root.name or str(root)
+        total_gb = info.bytesTotal() / 1e9
+        label = f"💾 {name}" if sys.platform != "win32" else f"💾 {root} {info.displayName()}"
+        if total_gb > 0:
+            label += f"  ({total_gb:,.0f} GB)"
+        volumes.append((label, root))
+    return sorted(volumes, key=lambda v: str(v[1]))
+
+
+class _VolumeCombo(QComboBox):
+    """Combo box that re-scans mounted volumes every time it is opened, so a
+    drive plugged in after start-up shows up without restarting the app."""
+
+    def __init__(self, refresh, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self._refresh = refresh
+
+    def showPopup(self) -> None:
+        self._refresh()
+        super().showPopup()
+
+
 def _display_width(name: str) -> int:
     """Rough fixed-width column count: non-ASCII counts as 2, ASCII as 1."""
     return sum(2 if ord(c) > 127 else 1 for c in name)
@@ -177,9 +253,16 @@ class FileBrowserPanel(QWidget):
         layout.addWidget(dir_label)
         self._startup_dir_label = dir_label
 
+        self.volume_combo = _VolumeCombo(self._populate_volumes)
+        self.volume_combo.setToolTip("外部ストレージなど、マウント中のボリュームへ移動します")
+        self.volume_combo.activated.connect(self._on_volume_selected)
+        layout.addWidget(self.volume_combo)
+        self._startup_root = self._current_root_dir
+        self._populate_volumes()
+
         self.file_model = QFileSystemModel()
         self.file_model.setRootPath(str(self._current_root_dir))
-        self.file_model.setNameFilters(["*.wvh", "*.iq.tar", "*.bin"])
+        self.file_model.setNameFilters(["*.wvh", "*.wv", "*.iq.tar", "*.bin"])
         self.file_model.setNameFilterDisables(False)
         self.file_model.setFilter(QDir.AllDirs | QDir.Files | QDir.NoDot | QDir.NoDotDot)
 
@@ -241,6 +324,25 @@ class FileBrowserPanel(QWidget):
         self.current_dir_changed.emit(target)
         self.status_message.emit(f"📁 {target}")
 
+    # ------------------------------------------------------------- volumes
+
+    def _populate_volumes(self) -> None:
+        self.volume_combo.blockSignals(True)
+        self.volume_combo.clear()
+        self.volume_combo.addItem("📀 ストレージを選択…", None)
+        self.volume_combo.addItem("🏠 ホーム", str(Path.home()))
+        self.volume_combo.addItem(f"📁 起動ディレクトリ ({self._startup_root.name})", str(self._startup_root))
+        for label, root in mounted_volumes():
+            self.volume_combo.addItem(label, str(root))
+        self.volume_combo.setCurrentIndex(0)
+        self.volume_combo.blockSignals(False)
+
+    def _on_volume_selected(self, index: int) -> None:
+        target = self.volume_combo.itemData(index)
+        self.volume_combo.setCurrentIndex(0)
+        if target:
+            self.set_root_dir(Path(target))
+
     # ------------------------------------------------------------- signals
 
     def _on_clicked(self, index) -> None:
@@ -267,7 +369,7 @@ class FileBrowserPanel(QWidget):
 
     @staticmethod
     def _is_iq_file(path: Path) -> bool:
-        if path.suffix in {".wvh", ".tar"} or path.name.endswith(".iq.tar"):
+        if path.suffix in {".wvh", ".wv", ".tar"} or path.name.endswith(".iq.tar"):
             return True
         # Keysight: .bin only counts if the matching .bin.txt sits next to it,
         # otherwise we'd pick up arbitrary firmware blobs that happen to share
@@ -282,6 +384,10 @@ class FileBrowserPanel(QWidget):
                 wv_loader = WVFileLoader()
                 header = wv_loader.parse_wvh(str(file_path))
                 body = _format_wvh_header(file_path, header)
+            elif file_path.suffix == ".wv":
+                smu_loader = SMUWVLoader()
+                header = smu_loader.parse_wv(file_path)
+                body = _format_smuwv_header(file_path, header)
             elif file_path.name.endswith(".iq.tar"):
                 tar_loader = IQTarLoader()
                 header = tar_loader.parse_iqtar(str(file_path))

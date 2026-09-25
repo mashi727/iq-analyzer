@@ -15,6 +15,7 @@ from iq_analyzer.core.spectrogram import (
     SpectrogramParams,
     auto_optimize_params,
     compute_spectrogram,
+    compute_spectrogram_streaming,
 )
 from iq_analyzer.core.stdout_redirector import StdoutRedirector
 
@@ -29,6 +30,7 @@ __all__ = [
     "auto_optimize_params",
     "color_for_percent",
     "compute_spectrogram",
+    "compute_spectrogram_streaming",
     "memory_status",
     "min_max_downsample",
 ]

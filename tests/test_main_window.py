@@ -79,3 +79,39 @@ def test_package_entry_points_importable(entry: str) -> None:
 
     module = importlib.import_module(entry)
     assert hasattr(module, "main")
+
+
+def test_stderr_and_logging_reach_output_panel(qapp) -> None:
+    import logging
+    import sys
+    import threading
+
+    from iq_analyzer.ui.main_window import RSIQViewer
+
+    viewer = RSIQViewer()
+    try:
+        print("plain stdout line")
+        sys.stderr.write("stderr line\n")
+
+        # Logged from a worker thread: must arrive via the queued signal.
+        t = threading.Thread(
+            target=lambda: logging.getLogger("iq_analyzer.test").warning("from thread")
+        )
+        t.start()
+        t.join()
+        qapp.processEvents()
+
+        text = viewer.stdout_text.toPlainText()
+        assert "plain stdout line" in text
+        assert "stderr line" in text
+        assert "[WARNING] iq_analyzer.test: from thread" in text
+        # Errors are rendered in red; stdout stays unstyled.
+        rich = viewer.stdout_text.toHtml()
+        assert "#ff6b6b" in rich
+    finally:
+        viewer.close()
+
+    import sys as _sys
+
+    assert _sys.stderr is not viewer.stderr_redirector
+    assert viewer._log_handler not in logging.getLogger("iq_analyzer").handlers

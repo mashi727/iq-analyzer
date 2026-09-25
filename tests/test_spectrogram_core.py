@@ -91,3 +91,32 @@ def test_compute_spectrogram_rejects_excessive_overlap() -> None:
     iq = np.zeros(512, dtype=np.complex64)
     with pytest.raises(ValueError):
         compute_spectrogram(iq, 256, 100.0, "hann", 1.0)
+
+
+def test_streaming_matches_in_memory_when_not_pooled() -> None:
+    from iq_analyzer.core.spectrogram import compute_spectrogram_streaming
+
+    rng = np.random.default_rng(0)
+    x = (rng.normal(size=200_000) + 1j * rng.normal(size=200_000)).astype(np.complex64)
+    f0, t0, s0 = compute_spectrogram(x, 512, 75, "hann", 1e6)
+    f1, t1, s1 = compute_spectrogram_streaming(lambda s, e: x[s:e], 0, len(x), 512, 75, "hann", 1e6)
+    np.testing.assert_allclose(f0, f1)
+    np.testing.assert_allclose(t0, t1)
+    np.testing.assert_allclose(s0, s1, atol=0.01)
+
+
+def test_streaming_pools_columns_and_keeps_single_frame_burst(monkeypatch) -> None:
+    import iq_analyzer.core.spectrogram as sp
+
+    monkeypatch.setattr(sp, "MAX_COLUMNS", 64)
+    n = 600_000
+    x = np.zeros(n, dtype=np.complex64)
+    x[:] = 1e-3
+    burst = 400_123
+    x[burst : burst + 256] = 1000.0 * np.exp(2j * np.pi * 0.25 * np.arange(256))
+
+    freqs, times, sxx = sp.compute_spectrogram_streaming(lambda s, e: x[s:e], 0, n, 256, 50, "hann", 1.0)
+    assert sxx.shape == (256, 64) or sxx.shape[1] <= 64
+    col = int(np.argmax(sxx.max(axis=0)))
+    assert times[col] <= burst < times[col] + (times[1] - times[0]) + 256
+    assert freqs[int(np.argmax(sxx[:, col]))] == pytest.approx(0.25, abs=1 / 256)

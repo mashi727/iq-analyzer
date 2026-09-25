@@ -93,7 +93,13 @@ def auto_color_levels(sxx_db: NDArray[np.floating]) -> tuple[float, float]:
     data_min = float(np.min(sxx_db))
     data_max = float(np.max(sxx_db))
     upper = float(np.percentile(sxx_db, 99))
-    lower = max(data_max - _CUTOFF_DB_FROM_MAX, data_min)
+    # ``max - 30 dB`` sits near the floor only when the peaks are isolated.
+    # With recurring strong bursts (e.g. RFI in a sky recording) it climbs above
+    # the 99th percentile and the whole floor falls below the colormap, so the
+    # image renders as a single flat shade. The median is a robust noise-floor
+    # estimate; never let the lower bound rise above it.
+    floor = float(np.median(sxx_db))
+    lower = max(min(data_max - _CUTOFF_DB_FROM_MAX, floor), data_min)
 
     if upper - lower < _MIN_DISPLAY_RANGE_DB:
         center = (upper + lower) / 2
@@ -193,7 +199,10 @@ class SpectrogramWidget(QWidget):
         self.spectrogram_data = sxx_db
 
         sxx_display = self._maybe_downsample(sxx_db)
-        min_level, max_level = auto_color_levels(sxx_db)
+        # Levels must come from what is actually shown: max-pooling shifts the
+        # noise-floor distribution up by several dB (the max of N noise cells),
+        # so levels taken from the raw STFT would saturate the whole image.
+        min_level, max_level = auto_color_levels(sxx_display)
 
         # Pass levels alongside the image data so the very first paint uses
         # the correct dynamic range. If we called setImage() and then setLevels()
@@ -221,6 +230,7 @@ class SpectrogramWidget(QWidget):
         self.current_min_level = min_level
         self.current_max_level = max_level
         self.current_sxx_db = sxx_db
+        self.current_display_db = sxx_display
 
         self.plot_item.setLabel("bottom", "時間", units=time_unit)
 
@@ -248,9 +258,12 @@ class SpectrogramWidget(QWidget):
 
     def _maybe_downsample(self, sxx_db: NDArray[np.floating]) -> NDArray[np.floating]:
         """Apply :func:`max_pool_2d` if the data is much bigger than the viewport."""
-        viewbox_rect = self.plot_item.getViewBox().viewRect()
-        widget_width = viewbox_rect.width()
-        widget_height = viewbox_rect.height()
+        # Size on screen in pixels. (viewRect() would be in data units, i.e.
+        # seconds × MHz, which made pooling silently never trigger and let
+        # short bursts get dropped by the painter's nearest-neighbour scaling.)
+        viewbox = self.plot_item.getViewBox()
+        widget_width = viewbox.width()
+        widget_height = viewbox.height()
 
         # Reject implausible viewport sizes (e.g. widget not yet realised).
         valid_viewport = (

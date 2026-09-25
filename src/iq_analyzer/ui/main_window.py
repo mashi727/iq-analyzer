@@ -10,7 +10,11 @@ already been pulled out into :mod:`iq_analyzer.core` and
 from __future__ import annotations
 
 import contextlib
+import html
+import logging
+import os
 import sys
+import time
 from pathlib import Path
 
 import numpy as np
@@ -36,11 +40,19 @@ from PySide6.QtWidgets import (
 from iq_analyzer.core import (
     StdoutRedirector,
     auto_optimize_params,
-    compute_spectrogram,
+    compute_spectrogram_streaming,
     memory_status,
     min_max_downsample,
 )
-from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, WVFileLoader
+from iq_analyzer.core.envelope import (
+    BASE_BIN,
+    Envelope,
+    amplitude_scale_of,
+    source_path,
+)
+from iq_analyzer.core.spectrogram import MAX_COLUMNS, spectrogram_columns
+from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, SMUWVLoader, WVFileLoader
+from iq_analyzer.ui.envelope_worker import EnvelopeWorker
 from iq_analyzer.widgets import (
     AdjustmentPanel,
     ControlPanel,
@@ -67,12 +79,18 @@ class RSIQViewer(QMainWindow):
     def __init__(self):
         super().__init__()
         self.wv_loader = None  # WVFileLoader, IQTarLoader, or KeysightBinLoader
-        self.file_type = None  # 'wv', 'iqtar', or 'keysight'
+        self.file_type = None  # 'wv', 'smuwv', 'iqtar', or 'keysight'
         self.total_samples = 0
         self.sample_rate = 1.0
         self.center_frequency = 0
         self.region_start = 0
         self.region_end = 100000
+
+        # 振幅エンベロープ（全体表示用の事前計算。core.envelope 参照）
+        self.envelope = None
+        self._envelope_worker = None
+        self._overview_preview = None  # 構築中に未計算部分を埋めるプレビュー (x, y)
+        self._in_stdout_flush = False  # append_stdout の processEvents 再入防止
 
         # 間引きパラメータ
         self.decimation_threshold = 0.5  # 閾値以上の信号は間引かない（将来の拡張用）
@@ -325,6 +343,8 @@ class RSIQViewer(QMainWindow):
             }}
         """)
         self.stdout_text.setPlaceholderText("標準出力がここに表示されます...")
+        # 行数上限はQt側で管理する（全文を書き直す方式だとエラー行の色が消える）
+        self.stdout_text.document().setMaximumBlockCount(1000)
 
         stdout_layout.addWidget(self.stdout_text)
         stdout_group.setLayout(stdout_layout)
@@ -350,6 +370,20 @@ class RSIQViewer(QMainWindow):
         self.stdout_redirector = StdoutRedirector(sys.stdout)
         self.stdout_redirector.text_written.connect(self.append_stdout)
         sys.stdout = self.stdout_redirector
+
+        # 標準エラー出力も同じパネルへ（赤字）。トレースバックやwarningsはここに出る。
+        # --windowed の EXE では sys.stderr が None になるので、その場合は捨て先を用意する。
+        self._stderr_original = sys.stderr
+        self.stderr_redirector = StdoutRedirector(sys.stderr or open(os.devnull, "w"))  # noqa: SIM115
+        self.stderr_redirector.text_written.connect(self.append_stderr)
+        sys.stderr = self.stderr_redirector
+
+        # iq_analyzer のロガー（WARNING以上）をstderr経路へ。バックグラウンドスレッドからの
+        # ログもシグナルのキュー接続でメインスレッドに渡るため、直接UIを触らない。
+        self._log_handler = logging.StreamHandler(self.stderr_redirector)
+        self._log_handler.setLevel(logging.WARNING)
+        self._log_handler.setFormatter(logging.Formatter("[%(levelname)s] %(name)s: %(message)s"))
+        logging.getLogger("iq_analyzer").addHandler(self._log_handler)
 
         # ステータスバー（水平レイアウト）
         status_container = QWidget()
@@ -482,6 +516,11 @@ class RSIQViewer(QMainWindow):
             # ========================================
             # 3. メモリマップをクローズ
             # ========================================
+            # エンベロープ構築スレッドはmemmapを直接読むため、ローダーより先に止める
+            self._stop_envelope_worker()
+            self.envelope = None
+            self._overview_preview = None
+
             if hasattr(self, 'wv_loader') and self.wv_loader is not None:
                 with contextlib.suppress(Exception):
                     self.wv_loader.close()
@@ -570,6 +609,22 @@ class RSIQViewer(QMainWindow):
                 fname = file_path_obj.name
                 size_gb = self.wv_loader.wvd_path.stat().st_size / 1e9
                 print(f"WVDサイズ: {size_gb:.2f} GB")
+            elif file_path_obj.suffix == '.wv':
+                # R&S ARB波形 (SMU-WV): ヘッダーとint16 IQが1ファイルに同居
+                print("形式: SMU-WV (.wv)")
+                self.file_type = 'smuwv'
+                self.wv_loader = SMUWVLoader()
+
+                print("WVタグを解析中...")
+                header = self.wv_loader.parse_wv(file_path)
+
+                print("波形ブロックをメモリマップで開いています...")
+                self.wv_loader.open_wv()
+
+                fname = file_path_obj.name
+                size_gb = file_path_obj.stat().st_size / 1e9
+                print(f"WVサイズ: {size_gb:.2f} GB")
+                print(f"波形データのバイトエントロピー: {self.wv_loader.payload_entropy:.5f} bit/byte")
             elif file_path_obj.suffix == '.bin' and file_path_obj.with_suffix('.bin.txt').exists():
                 # Keysight N5110A .bin
                 print("形式: Keysight N5110A (.bin + .bin.txt)")
@@ -607,9 +662,12 @@ class RSIQViewer(QMainWindow):
                 f"Fs={self.sample_rate/1e6:.1f} MHz | Fc={self.center_frequency/1e6:.1f} MHz | {size_gb:.2f} GB"
             )
 
-            # Region初期化（中央10%）- 時間ベースで設定
-            initial_start = int(self.total_samples * 0.45)
-            initial_end = int(self.total_samples * 0.55)
+            # Region初期化（中央10%、ただし最大 MAX_INITIAL_REGION サンプル）
+            # 100 GB級では10%でも数十億サンプルになり、初回のスペクトログラム計算
+            # だけで数分かかるため上限を設ける。
+            initial_len = min(int(self.total_samples * 0.10), self.MAX_INITIAL_REGION)
+            initial_start = max(0, (self.total_samples - initial_len) // 2)
+            initial_end = initial_start + initial_len
             initial_start_time = initial_start / self.sample_rate
             initial_end_time = initial_end / self.sample_rate
 
@@ -621,6 +679,9 @@ class RSIQViewer(QMainWindow):
             self.region_start = initial_start
             self.region_end = initial_end
             print(f"Region初期化: {initial_start:,} ~ {initial_end:,} (中央10%, {initial_start_time:.6f}s ~ {initial_end_time:.6f}s)")
+
+            # 振幅エンベロープ: キャッシュがあれば即座に使い、無ければ裏で構築開始
+            self._start_envelope()
 
             # フルスパン波形の表示（Min-Maxダウンサンプリング）
             print("フルスパン波形を表示中...")
@@ -648,6 +709,17 @@ class RSIQViewer(QMainWindow):
             # WVH/WVD不整合チェックと自動修正（WV形式のみ）
             if self.file_type == 'wv' and hasattr(self.wv_loader, 'header_mismatch') and self.wv_loader.header_mismatch:
                 self.prompt_fix_wvh_header()
+
+            # 暗号化などでIQとして解釈できない .wv は、表示はするが明示的に警告する
+            if self.file_type == 'smuwv' and self.wv_loader.payload_looks_random:
+                QMessageBox.warning(
+                    self,
+                    "波形データの警告",
+                    f"{fname} の波形データは一様乱数と統計的に区別できません\n"
+                    f"(バイトエントロピー {self.wv_loader.payload_entropy:.4f} bit/byte, 上限 8)。\n\n"
+                    "暗号化された波形ファイルの可能性が高く、表示される波形・スペクトルは\n"
+                    "実際の信号を表していません。",
+                )
 
             print("=" * 60)
             print("[ファイル読み込み完了]")
@@ -894,7 +966,20 @@ class RSIQViewer(QMainWindow):
             self.region_curve.setData([], [])
 
     def _minmax_downsample(self, start_sample, end_sample, target_pixels):
-        """Min-Max ダウンサンプリング（iq_analyzer.core.min_max_downsample へ委譲）。"""
+        """Min-Max ダウンサンプリング。
+
+        1ピクセルがエンベロープの2ビン以上にまたがり、その範囲が計算済みなら
+        エンベロープから即答する（全サンプルが寄与するのでパルスも落ちない）。
+        それ以外は core.min_max_downsample（狭い範囲は厳密、広い範囲は
+        プレビュー）に委譲する。
+        """
+        env = self.envelope
+        if (
+            env is not None
+            and (end_sample - start_sample) >= 2 * BASE_BIN * target_pixels
+            and env.covers(start_sample, end_sample)
+        ):
+            return env.minmax(start_sample, end_sample, target_pixels, self.sample_rate)
         return min_max_downsample(
             self.wv_loader.get_iq_data,
             start_sample,
@@ -902,6 +987,86 @@ class RSIQViewer(QMainWindow):
             target_pixels,
             self.sample_rate,
         )
+
+    # 初期Regionの上限（2^28 ≈ 2.7億サンプル = int16で1 GB）
+    MAX_INITIAL_REGION = 1 << 28
+
+    def _fullspan_data(self, target_pixels):
+        """全体波形の (x, y)。エンベロープ構築中は計算済み部分＋プレビューを継ぎ合わせる。"""
+        env = self.envelope
+        if env is not None and env.complete:
+            return env.minmax(0, self.total_samples, target_pixels, self.sample_rate)
+
+        if self._overview_preview is None:
+            self._overview_preview = min_max_downsample(
+                self.wv_loader.get_iq_data, 0, self.total_samples, target_pixels, self.sample_rate
+            )
+        px, py = self._overview_preview
+        done = 0 if env is None else env.valid_samples - env.valid_samples % BASE_BIN
+        if done < 2 * BASE_BIN:
+            return px, py
+
+        pixels_done = max(1, int(target_pixels * done / self.total_samples))
+        ex, ey = env.minmax(0, done, pixels_done, self.sample_rate)
+        keep = px > done / self.sample_rate
+        return np.concatenate([ex, px[keep]]), np.concatenate([ey, py[keep]])
+
+    def _start_envelope(self):
+        """振幅エンベロープをキャッシュから読むか、バックグラウンドで構築する。"""
+        self._stop_envelope_worker()
+        self._overview_preview = None
+        src = source_path(self.wv_loader)
+        cached = Envelope.load_cached(src, self.total_samples) if src is not None else None
+        if cached is not None:
+            self.envelope = cached
+            print("[エンベロープ] キャッシュを使用（全体波形は全サンプルから計算済み）")
+            return
+
+        self.envelope = Envelope(self.total_samples, amplitude_scale_of(self.wv_loader))
+        worker = EnvelopeWorker(self.wv_loader, self.envelope, self)
+        worker.progress.connect(self._on_envelope_progress)
+        worker.completed.connect(self._on_envelope_completed)
+        self._envelope_worker = worker
+        self._envelope_t0 = time.monotonic()
+        print("[エンベロープ] バックグラウンドで構築開始（初回のみ。以後はキャッシュ）")
+        worker.start()
+
+    def _stop_envelope_worker(self):
+        worker = getattr(self, '_envelope_worker', None)
+        if worker is not None:
+            with contextlib.suppress(Exception):
+                worker.progress.disconnect()
+                worker.completed.disconnect()
+            worker.stop()
+            self._envelope_worker = None
+
+    def _on_envelope_progress(self, done, total):
+        if self.is_closing or self.envelope is None:
+            return
+        elapsed = time.monotonic() - self._envelope_t0
+        rate = done / elapsed if elapsed > 0 else 0
+        eta = (total - done) / rate if rate > 0 else 0
+        self.status_label.setText(
+            f"⏳ 全体波形を計算中 {done / total * 100:.0f}% "
+            f"({done * 4 / 1e9 / max(elapsed, 1e-9):.2f} GB/s, 残り約 {eta:.0f} 秒) — 操作は可能です"
+        )
+        with contextlib.suppress(Exception):
+            self.overview_curve.setData(*self._fullspan_data(4000))
+
+    def _on_envelope_completed(self, saved):
+        if self.is_closing or self.envelope is None:
+            return
+        elapsed = time.monotonic() - self._envelope_t0
+        self._envelope_worker = None
+        self._overview_preview = None
+        print(f"[エンベロープ] 構築完了 {elapsed:.1f} 秒" + ("（キャッシュ保存済み）" if saved else "（キャッシュ保存失敗）"))
+        self.status_label.setText(f"✅ 全体波形の計算完了 ({elapsed:.0f} 秒)")
+        self.show_fullspan_waveform()
+        self._event_state['programmatic_update'] = True
+        try:
+            self.update_region_waveform()
+        finally:
+            self._event_state['programmatic_update'] = False
 
     def show_fullspan_waveform(self):
         """
@@ -920,8 +1085,7 @@ class RSIQViewer(QMainWindow):
             # 画面幅に応じた目標ピクセル数（4000ピクセル分）
             target_pixels = 4000
 
-            # Min-Maxダウンサンプリング
-            x_data, y_data = self._minmax_downsample(0, self.total_samples, target_pixels)
+            x_data, y_data = self._fullspan_data(target_pixels)
 
             # プロット
             self.overview_curve.setData(x_data, y_data)
@@ -1326,11 +1490,12 @@ class RSIQViewer(QMainWindow):
                 print(f"[パラメータ最適化] {opt_msg}")
                 print(f"  NFFT: {nfft}, オーバーラップ: {overlap_percent}%, ウィンドウ: {window}")
 
-            # メモリ使用量推定（8GB RAM環境での安全性チェック）
-            iq_data_mb = (region_samples * 8) / 1024 / 1024  # complex64
-            time_frames = int(region_samples / (nfft * (1 - overlap_percent/100)))
-            spectrogram_mb = (nfft * time_frames * 4) / 1024 / 1024  # float32
-            total_estimated_mb = iq_data_mb + spectrogram_mb
+            # メモリ使用量推定: 分割読み込み＋時間方向max-poolにより、
+            # Region長に依存せず「FFTバッチ + nfft×MAX_COLUMNS」で頭打ちになる
+            time_frames, frames_per_col = spectrogram_columns(region_samples, nfft, overlap_percent)
+            columns = -(-time_frames // frames_per_col)
+            spectrogram_mb = (nfft * columns * 4) / 1024 / 1024  # float32
+            total_estimated_mb = spectrogram_mb + 64  # + FFTバッチ(約32 MB×2)
 
             # メモリ使用量をログに出力（警告ダイアログは表示しない）
             if total_estimated_mb > 2000:
@@ -1354,20 +1519,23 @@ class RSIQViewer(QMainWindow):
             print(f"  推定メモリ使用量: {total_estimated_mb:.1f} MB")
             print("=" * 60)
 
-            # IQデータ取得（保存した範囲を使用）
-            print("IQデータを読み込み中...")
-            iq_data = self.wv_loader.get_iq_data(
-                start_sample=spectrogram_start,
-                end_sample=spectrogram_end
-            )
-            print(f"データ読み込み完了: {len(iq_data):,} samples")
+            if frames_per_col > 1:
+                print(f"  時間方向max-pool: {frames_per_col}フレーム/列 → {columns}列 (上限 {MAX_COLUMNS})")
 
-            # STFT を core ヘルパへ委譲
+            # IQは分割して読みながらSTFT（全Regionを一度にメモリへ載せない）
+            last_pct = [-1]
+
             def _report(done, total):
-                print(f"  進捗: {done / total * 100:.1f}% ({done}/{total})")
+                pct = done * 100 // total
+                if pct >= last_pct[0] + 5 or done == total:
+                    last_pct[0] = pct
+                    print(f"  進捗: {pct}% ({done:,}/{total:,} フレーム)")
+                    self.status_label.setText(f"⏳ スペクトログラム計算中... {pct}%")
 
-            frequencies, times, sxx_db = compute_spectrogram(
-                iq_data,
+            frequencies, times, sxx_db = compute_spectrogram_streaming(
+                self.wv_loader.get_iq_data,
+                spectrogram_start,
+                spectrogram_end,
                 nfft=nfft,
                 overlap_percent=overlap_percent,
                 window=window,
@@ -1468,6 +1636,8 @@ class RSIQViewer(QMainWindow):
         # デフォルトファイル名生成
         if self.file_type == 'wv' and hasattr(self.wv_loader, 'wvh_path') and self.wv_loader.wvh_path:
             default_name = self.wv_loader.wvh_path.stem + f"_region_{self.region_start}_{self.region_end}"
+        elif self.file_type == 'smuwv' and getattr(self.wv_loader, 'wv_path', None):
+            default_name = self.wv_loader.wv_path.stem + f"_region_{self.region_start}_{self.region_end}"
         elif self.file_type == 'iqtar' and hasattr(self.wv_loader, 'tar_path') and self.wv_loader.tar_path:
             default_name = self.wv_loader.tar_path.stem + f"_region_{self.region_start}_{self.region_end}"
         elif self.file_type == 'keysight' and hasattr(self.wv_loader, 'bin_path') and self.wv_loader.bin_path:
@@ -1523,7 +1693,7 @@ class RSIQViewer(QMainWindow):
             header_template = self.wv_loader.header.copy()
 
             # WVH/WVD形式に必要なフィールドを追加/上書き
-            if self.file_type in ('iqtar', 'keysight'):
+            if self.file_type in ('iqtar', 'keysight', 'smuwv'):
                 header_template['TYPE'] = 'RAW16LE'
                 header_template['COMPONENTS'] = 'IQ'
                 header_template['RESOLUTION'] = 16
@@ -1578,7 +1748,10 @@ class RSIQViewer(QMainWindow):
             # スペクトログラムがまだ計算されていない
             return
 
-        sxx_db = self.spectrogram_widget.current_sxx_db
+        # 表示中（max-pool後）のデータでパーセンタイルを取る。生データだと
+        # プーリングで持ち上がったノイズフロアとレベルがずれて全面が飽和する。
+        sxx_db = getattr(self.spectrogram_widget, 'current_display_db',
+                         self.spectrogram_widget.current_sxx_db)
 
         # パーセンタイルベースでレベルを再計算
         min_level = np.percentile(sxx_db, value)
@@ -1623,43 +1796,51 @@ class RSIQViewer(QMainWindow):
 
 
     def append_stdout(self, text):
+        """標準出力テキストをパネルに追加する。"""
+        self._append_log(text, error=False)
+
+    def append_stderr(self, text):
+        """標準エラー出力（トレースバック、警告、ログ）を赤字でパネルに追加する。"""
+        self._append_log(text, error=True)
+
+    def _append_log(self, text, *, error):
         """
-        標準出力テキストをテキストエリアに追加
+        出力パネルへの追記
 
         print()の出力ごとに即座に表示されるようにUIを強制更新する。
         ただし、終了処理中はprocessEvents()を呼ばない（segfault回避）。
-
-        Args:
-            text: 追加するテキスト
         """
         # 終了処理中は何もしない（Segmentation fault回避）
         if self.is_closing:
             return
 
         try:
-            # テキストを追加
-            self.stdout_text.append(text.rstrip())
+            body = text.rstrip()
+            if error:
+                # white-space:pre-wrap でトレースバックの字下げを保つ
+                escaped = html.escape(body)
+                self.stdout_text.append(
+                    f'<span style="color:#ff6b6b; white-space:pre-wrap;">{escaped}</span>'
+                )
+            else:
+                self.stdout_text.append(body)
 
             # 自動スクロール（最新の出力が常に表示される）
             cursor = self.stdout_text.textCursor()
             cursor.movePosition(QTextCursor.End)
             self.stdout_text.setTextCursor(cursor)
 
-            # 最大行数制限（メモリ節約のため、古い行を削除）
-            max_lines = 1000
-            text_lines = self.stdout_text.toPlainText().split('\n')
-            if len(text_lines) > max_lines:
-                # 古い行を削除
-                self.stdout_text.setPlainText('\n'.join(text_lines[-max_lines:]))
-                # カーソルを最後に移動
-                cursor = self.stdout_text.textCursor()
-                cursor.movePosition(QTextCursor.End)
-                self.stdout_text.setTextCursor(cursor)
-
             # UIを即座に更新（print()ごとにリアルタイム表示）
-            # ただし終了処理中は呼ばない
-            if not self.is_closing:
-                QCoreApplication.processEvents()
+            # ただし終了処理中と、既にこの中から呼ばれている場合（再入）は呼ばない。
+            # print()は描画・シグナル処理の途中からも呼ばれるため、無条件に
+            # processEvents()すると再帰的な再描画でセグメンテーション違反になる
+            # ことがある（バックグラウンドのエンベロープ構築で発生頻度が上がった）。
+            if not self.is_closing and not self._in_stdout_flush:
+                self._in_stdout_flush = True
+                try:
+                    QCoreApplication.processEvents()
+                finally:
+                    self._in_stdout_flush = False
         except Exception:
             # 終了処理中にオブジェクトが削除されている場合は無視
             pass
@@ -1757,6 +1938,13 @@ class RSIQViewer(QMainWindow):
                     # 標準出力を元に戻す
                     sys.stdout = self.stdout_redirector.original_stdout
                     self.stdout_redirector = None
+            if getattr(self, 'stderr_redirector', None) is not None:
+                with contextlib.suppress(Exception):
+                    logging.getLogger("iq_analyzer").removeHandler(self._log_handler)
+                    self.stderr_redirector.text_written.disconnect()
+                with contextlib.suppress(Exception):
+                    sys.stderr = self._stderr_original
+                    self.stderr_redirector = None
 
             # 2. メモリ更新タイマーを停止
             if hasattr(self, 'memory_timer') and self.memory_timer:
@@ -1779,6 +1967,9 @@ class RSIQViewer(QMainWindow):
                         self.region_viewbox.sigRangeChanged.disconnect()
 
             # 4. メモリマップを先にクローズ（プロットデータより前に）
+            #    エンベロープ構築スレッドがmemmapを読んでいるので、さらにその前に止める
+            with contextlib.suppress(Exception):
+                self._stop_envelope_worker()
             if hasattr(self, 'wv_loader') and self.wv_loader is not None:
                 with contextlib.suppress(Exception):
                     self.wv_loader.close()

@@ -66,3 +66,20 @@ def test_x_axis_uses_sample_rate() -> None:
     x, _ = min_max_downsample(_amp_getter(amplitudes), 0, n, target_pixels=100, sample_rate=sample_rate)
     assert x[0] == pytest.approx((n / 100) / 2 / sample_rate, rel=0.05)
     assert x[-1] < n / sample_rate
+
+
+def test_huge_range_reads_only_a_bounded_preview() -> None:
+    """A range far larger than memory must not be read in full."""
+    from iq_analyzer.core.decimation import PREVIEW_BLOCK, PREVIEW_MAX_READS
+
+    n = 25_000_000_000  # ~100 GB of int16 IQ
+    read = [0]
+
+    def get(start: int, end: int) -> np.ndarray:
+        read[0] += end - start
+        return np.ones(end - start, dtype=np.complex64)
+
+    x, _ = min_max_downsample(get, 0, n, target_pixels=4000, sample_rate=250e6)
+    assert len(x) == 2 * PREVIEW_MAX_READS
+    assert read[0] <= PREVIEW_MAX_READS * PREVIEW_BLOCK
+    assert np.all(np.diff(x[0::2]) > 0)

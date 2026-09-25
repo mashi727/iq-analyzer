@@ -62,3 +62,7 @@ Thumbs.db
 *.wvh
 *.iq.tar
 *.complex*.float32
+*.wv
+
+# Local sample recordings (multi-GB)
+resources/

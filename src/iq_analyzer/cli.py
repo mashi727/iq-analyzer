@@ -62,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 60)
     print("Rohde & Schwarz IQ Data Viewer")
     print("Target: Windows 11, Core i3, 8GB RAM")
-    print("Supported formats: WVH/WVD, iq.tar")
+    print("Supported formats: WVH/WVD, .wv (SMU-WV), iq.tar, Keysight .bin")
     print("=" * 60)
     print("アプリケーションが起動しました。")
     print("左側のファイルブラウザからファイルをダブルクリックしてください。")

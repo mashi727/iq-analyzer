@@ -164,3 +164,85 @@ def compute_spectrogram(
 
     sxx_db = (10 * np.log10(sxx + 1e-12)).astype(np.float32)
     return frequencies, times, sxx_db
+
+
+# Upper bound on spectrogram columns kept in memory. The display max-pools to
+# the viewport anyway (~1–2k px), so 4096 keeps ≥2× headroom while capping the
+# output at nfft × 4096 × 4 B (134 MB for NFFT=8192) regardless of region size.
+MAX_COLUMNS = 4096
+# Complex values per FFT batch (frames × nfft): 4 Mi × 8 B = 32 MB.
+_BATCH_VALUES = 1 << 22
+
+
+def spectrogram_columns(region_samples: int, nfft: int, overlap_percent: float) -> tuple[int, int]:
+    """Return ``(num_frames, frames_per_column)`` for a streamed spectrogram."""
+    hop = nfft - int(nfft * overlap_percent / 100)
+    num_frames = 1 + max(0, region_samples - nfft) // hop
+    per_column = -(-num_frames // MAX_COLUMNS)
+    return num_frames, per_column
+
+
+def compute_spectrogram_streaming(
+    get_iq_data: Callable[[int, int], NDArray[np.complexfloating]],
+    start_sample: int,
+    end_sample: int,
+    nfft: int,
+    overlap_percent: float,
+    window: str,
+    sample_rate: float,
+    *,
+    progress: Callable[[int, int], None] | None = None,
+) -> tuple[NDArray[np.floating], NDArray[np.floating], NDArray[np.float32]]:
+    """Bounded-memory spectrogram of ``[start_sample, end_sample)``.
+
+    Same output convention as :func:`compute_spectrogram`, but the IQ is read
+    in batches instead of all at once, and when the region has more than
+    :data:`MAX_COLUMNS` frames, consecutive frames are max-pooled into one
+    column. Every frame is still computed, so a burst lasting a single frame
+    survives — only its time position is quantised to the column width.
+
+    Peak memory is O(batch + nfft × MAX_COLUMNS), independent of region length:
+    a 10% region of a 100 GB file would otherwise need ~20 GB of complex64.
+    """
+    import scipy.fft
+
+    nfft = int(nfft)
+    hop = nfft - int(nfft * overlap_percent / 100)
+    if hop <= 0:
+        raise ValueError("overlap too large: hop_length must be positive")
+    region = end_sample - start_sample
+    if region < nfft:
+        raise ValueError(f"Region ({region} samples) is shorter than NFFT ({nfft})")
+
+    num_frames, per_col = spectrogram_columns(region, nfft, overlap_percent)
+    num_cols = -(-num_frames // per_col)
+    win = _build_window(window, nfft).astype(np.float32)
+    batch = max(1, _BATCH_VALUES // nfft)
+
+    sxx = np.zeros((nfft, num_cols), dtype=np.float32)
+    f = 0
+    while f < num_frames:
+        f_end = min(f + batch, num_frames)
+        s = start_sample + f * hop
+        x = get_iq_data(s, s + (f_end - f - 1) * hop + nfft)
+        frames = np.lib.stride_tricks.sliding_window_view(x, nfft)[::hop][: f_end - f] * win
+        spec = scipy.fft.fft(frames, axis=1, workers=-1)
+        power = (spec.real * spec.real + spec.imag * spec.imag).astype(np.float32)
+        del frames, spec
+
+        # Max-pool frames that fall into the same output column.
+        cols = np.arange(f, f_end) // per_col
+        starts = np.flatnonzero(np.r_[True, cols[1:] != cols[:-1]])
+        pooled = np.maximum.reduceat(power, starts, axis=0).T
+        c = cols[starts]
+        sxx[:, c] = np.maximum(sxx[:, c], pooled)
+
+        f = f_end
+        if progress is not None:
+            progress(f, num_frames)
+
+    sxx = np.fft.fftshift(sxx, axes=0)
+    frequencies = np.fft.fftshift(np.fft.fftfreq(nfft, d=1 / sample_rate))
+    times = np.arange(num_cols) * per_col * hop / sample_rate
+    sxx_db = (10 * np.log10(sxx + 1e-12)).astype(np.float32)
+    return frequencies, times, sxx_db
