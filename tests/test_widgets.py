@@ -13,42 +13,9 @@ import pytest
 from iq_analyzer.widgets import (
     AVAILABLE_COLORMAPS,
     AdjustmentPanel,
-    BreadcrumbBar,
     ControlPanel,
     FileBrowserPanel,
 )
-
-
-def test_breadcrumb_set_path_emits_clicks_per_segment(qapp) -> None:
-    bar = BreadcrumbBar(font_size_pt=10)
-    bar.set_path(Path("/tmp/a/b"))
-    assert bar.current_path == Path("/tmp/a/b")
-
-    received: list[Path] = []
-    bar.path_clicked.connect(received.append)
-
-    # Each segment is a QPushButton sitting in the layout (separators are QLabel).
-    from PySide6.QtWidgets import QPushButton
-
-    buttons = [
-        bar.layout().itemAt(i).widget()
-        for i in range(bar.layout().count())
-        if isinstance(bar.layout().itemAt(i).widget(), QPushButton)
-    ]
-    # Path has 4 segments on POSIX: /, tmp, a, b
-    assert len(buttons) == 4
-    buttons[-1].click()
-    buttons[0].click()
-    assert received == [Path("/tmp/a/b"), Path("/")]
-
-
-def test_breadcrumb_set_path_rebuilds_cleanly(qapp) -> None:
-    bar = BreadcrumbBar()
-    bar.set_path("/tmp/a")
-    first_count = bar.layout().count()
-    bar.set_path("/tmp/a/b/c")
-    second_count = bar.layout().count()
-    assert second_count > first_count  # more segments now
 
 
 def test_adjustment_panel_signals(qapp) -> None:
@@ -122,15 +89,6 @@ def test_control_panel_busy_state_round_trip(qapp) -> None:
     assert "スペクトログラム" in panel.calc_spec_btn.text()
 
 
-def test_control_panel_breadcrumb_forwards_clicks(qapp) -> None:
-    panel = ControlPanel()
-    received: list[Path] = []
-    panel.breadcrumb_path_clicked.connect(received.append)
-    # Drive the inner bar directly — we're verifying the forwarding hookup.
-    panel.breadcrumb.path_clicked.emit(Path("/some/where"))
-    assert received == [Path("/some/where")]
-
-
 def test_file_browser_set_root_dir_emits_signal(qapp, tmp_path: Path) -> None:
     panel = FileBrowserPanel()
     seen_dirs: list[Path] = []
@@ -192,17 +150,73 @@ def test_adjustment_panel_lists_every_known_colormap(qapp, name) -> None:
     assert name in items
 
 
-def test_file_browser_volume_selector(qapp, tmp_path) -> None:
-    from iq_analyzer.widgets.file_browser import FileBrowserPanel, mounted_volumes
+def _tree_labels(item) -> list[str]:
+    return [item.child(i).text(0) for i in range(item.childCount())]
 
-    for label, root in mounted_volumes():
-        assert label and root.exists()
 
-    panel = FileBrowserPanel()
-    combo = panel.volume_combo
-    targets = [combo.itemData(i) for i in range(combo.count())]
-    assert targets[0] is None  # placeholder
-    home_index = targets.index(str(__import__("pathlib").Path.home()))
-    combo.activated.emit(home_index)
-    assert panel.current_root_dir == __import__("pathlib").Path.home()
-    assert combo.currentIndex() == 0
+def _make_iq_folder(root: Path) -> Path:
+    folder = root / "rec"
+    (folder / "sub").mkdir(parents=True)
+    (folder / "a.wvh").write_text("{TYPE:RAW16LE}{CLOCK:1}{SAMPLES:1}")
+    (folder / "a.wvd").write_bytes(b"\0" * 4)
+    (folder / "b.wv").write_bytes(b"{TYPE: SMU-WV,0}")
+    (folder / "notes.txt").write_text("not IQ")
+    (folder / "firmware.bin").write_bytes(b"\0")  # no .bin.txt -> not IQ
+    (folder / ".hidden.wvh").write_text("")
+    return folder
+
+
+def test_file_browser_top_level_structure(qapp, tmp_path: Path) -> None:
+    from iq_analyzer.widgets.file_browser import _COMPUTER_LABEL, mounted_volumes
+
+    panel = FileBrowserPanel(tmp_path)
+    tops = [panel.tree.topLevelItem(i).text(0) for i in range(panel.tree.topLevelItemCount())]
+    assert tops == ["..", tmp_path.name, "ホーム", _COMPUTER_LABEL]
+    assert _tree_labels(panel._mac) == [name for name, _ in mounted_volumes()]
+    assert panel._mac.isExpanded() and not panel._start_item.isExpanded()
+
+
+def test_file_browser_lists_folders_then_iq_files_only(qapp, tmp_path: Path) -> None:
+    folder = _make_iq_folder(tmp_path)
+    panel = FileBrowserPanel(folder)
+    panel._start_item.setExpanded(True)
+    assert _tree_labels(panel._start_item) == ["sub", "a.wvd", "a.wvh", "b.wv"]
+
+
+def test_file_browser_go_up_reroots_and_selects_previous(qapp, tmp_path: Path) -> None:
+    folder = _make_iq_folder(tmp_path)
+    panel = FileBrowserPanel(folder)
+    seen: list[Path] = []
+    panel.current_dir_changed.connect(seen.append)
+
+    panel._on_clicked(panel._up_item, 0)
+
+    assert panel.current_root_dir == tmp_path
+    assert seen == [tmp_path]
+    assert panel.tree.currentItem().text(0) == "rec"
+
+
+def test_file_browser_click_previews_double_click_opens(qapp, tmp_path: Path) -> None:
+    folder = _make_iq_folder(tmp_path)
+    panel = FileBrowserPanel(folder)
+    opened: list[Path] = []
+    panel.file_open_requested.connect(opened.append)
+
+    assert panel.reveal(folder / "b.wv")
+    item = panel.tree.currentItem()
+    assert item.text(0) == "b.wv"
+    assert "b.wv" in panel.header_info_text.toPlainText()  # preview on selection
+    assert opened == []
+
+    panel._on_double_clicked(item, 0)
+    assert opened == [folder / "b.wv"]
+
+
+def test_file_browser_picks_up_new_files(qapp, tmp_path: Path) -> None:
+    folder = _make_iq_folder(tmp_path)
+    panel = FileBrowserPanel(folder)
+    panel._start_item.setExpanded(True)
+    (folder / "c.wv").write_bytes(b"")
+    panel._on_dir_changed(str(folder))
+    panel._refresh_dirty()
+    assert "c.wv" in _tree_labels(panel._start_item)

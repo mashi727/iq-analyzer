@@ -1,19 +1,14 @@
-"""Top row of the main window: breadcrumb + action buttons."""
+"""Top row of the main window: the main action buttons."""
 
 from __future__ import annotations
-
-from pathlib import Path
 
 from PySide6.QtCore import Signal
 from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
 
-from iq_analyzer.widgets.breadcrumb import BreadcrumbBar
-
 
 class ControlPanel(QWidget):
-    """Breadcrumb on the left, the three main action buttons on the right."""
+    """The three main action buttons, right-aligned."""
 
-    breadcrumb_path_clicked = Signal(Path)
     calculate_clicked = Signal()
     save_clicked = Signal()
     exit_clicked = Signal()
@@ -32,10 +27,6 @@ class ControlPanel(QWidget):
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-
-        self.breadcrumb = BreadcrumbBar(font_size_pt=font_size_large)
-        self.breadcrumb.path_clicked.connect(self.breadcrumb_path_clicked.emit)
-        layout.addWidget(self.breadcrumb, 0)
 
         layout.addStretch()
 
@@ -80,9 +71,6 @@ class ControlPanel(QWidget):
 
     def set_save_enabled(self, enabled: bool) -> None:
         self.save_btn.setEnabled(enabled)
-
-    def set_breadcrumb_path(self, path: Path | str) -> None:
-        self.breadcrumb.set_path(path)
 
     def _make_button(self, label: str, tooltip: str, *, background: str, hover: str) -> QPushButton:
         btn = QPushButton(label)

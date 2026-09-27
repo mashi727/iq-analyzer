@@ -166,3 +166,29 @@ def test_close_is_idempotent(tmp_path: Path) -> None:
     loader.close()
     loader.close()  # must not raise
     assert loader.data_memmap is None
+
+
+def test_renamed_pair_is_matched_by_size(tmp_path: Path) -> None:
+    """X_header.wvh + X_data.wvd (renamed recording) must still open, from either half."""
+    wvh, wvd, expected = _write_wv_pair(tmp_path / "tmp", samples=512)
+    wvh = wvh.rename(tmp_path / "Sky_header.wvh")
+    wvd = wvd.rename(tmp_path / "Sky_data.wvd")
+    # A decoy of a different size in the same folder must not be picked.
+    np.zeros(100, dtype=np.int16).tofile(tmp_path / "other.wvd")
+
+    for entry in (wvh, wvd):
+        loader = open_iq_file(entry)
+        assert loader.wvd_path == wvd
+        assert loader.wvh_path == wvh
+        np.testing.assert_array_equal(loader.get_iq_data(), expected)
+        loader.close()
+
+
+def test_ambiguous_pair_reports_candidates(tmp_path: Path) -> None:
+    wvh, wvd, _ = _write_wv_pair(tmp_path / "tmp", samples=64)
+    wvh.rename(tmp_path / "A_header.wvh")
+    wvd.rename(tmp_path / "A_data1.wvd")
+    (tmp_path / "A_data2.wvd").write_bytes((tmp_path / "A_data1.wvd").read_bytes())
+
+    with pytest.raises(FileNotFoundError, match=r"A_data1\.wvd, A_data2\.wvd"):
+        WVFileLoader().parse_wvh(tmp_path / "A_header.wvh")

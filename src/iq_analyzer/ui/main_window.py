@@ -10,7 +10,6 @@ already been pulled out into :mod:`iq_analyzer.core` and
 from __future__ import annotations
 
 import contextlib
-import html
 import logging
 import os
 import sys
@@ -20,7 +19,14 @@ from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
 from PySide6.QtCore import QCoreApplication, Qt, QTimer
-from PySide6.QtGui import QKeySequence, QShortcut, QTextCursor
+from PySide6.QtGui import (
+    QColor,
+    QKeySequence,
+    QShortcut,
+    QTextBlockFormat,
+    QTextCharFormat,
+    QTextCursor,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QFileDialog,
@@ -44,6 +50,7 @@ from iq_analyzer.core import (
     memory_status,
     min_max_downsample,
 )
+from iq_analyzer.core.decimation import preview_downsample
 from iq_analyzer.core.envelope import (
     BASE_BIN,
     Envelope,
@@ -52,6 +59,7 @@ from iq_analyzer.core.envelope import (
 )
 from iq_analyzer.core.spectrogram import MAX_COLUMNS, spectrogram_columns
 from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, SMUWVLoader, WVFileLoader
+from iq_analyzer.loaders.wv import resolve_wvh
 from iq_analyzer.ui.envelope_worker import EnvelopeWorker
 from iq_analyzer.widgets import (
     AdjustmentPanel,
@@ -194,7 +202,6 @@ class RSIQViewer(QMainWindow):
         self.control_panel.calculate_clicked.connect(self.calculate_spectrogram)
         self.control_panel.save_clicked.connect(self.save_region)
         self.control_panel.exit_clicked.connect(self.safe_exit)
-        self.control_panel.breadcrumb_path_clicked.connect(self._on_breadcrumb_clicked)
         # 旧 attribute alias（既存メソッドが直接参照しているため）
         self.calc_spec_btn = self.control_panel.calc_spec_btn
         self.save_btn = self.control_panel.save_btn
@@ -208,15 +215,12 @@ class RSIQViewer(QMainWindow):
             font_size_large=self.font_size_large,
             font_size_small=self.font_size_small,
         )
-        self.file_browser.current_dir_changed.connect(self.control_panel.set_breadcrumb_path)
         self.file_browser.file_open_requested.connect(
             lambda p: self.load_file(str(p))
         )
         self.file_browser.status_message.connect(
             lambda msg: self.status_label.setText(msg)
         )
-        # 初期パンくず
-        self.control_panel.set_breadcrumb_path(self.file_browser.current_root_dir)
         main_splitter.addWidget(self.file_browser)
 
         # === 右側：プロット表示エリア（垂直分割） ===
@@ -311,8 +315,13 @@ class RSIQViewer(QMainWindow):
         main_splitter.addWidget(plot_container)
 
         # メインスプリッターのサイズ比率設定
-        # ファイルブラウザ:プロット表示 = 1:8 (幅を半分に)
-        main_splitter.setSizes([150, 1200])
+        # ファイルブラウザ:プロット表示 = 1:4（ウィンドウ幅の20%）。
+        # 1:8 ではツリー3階層目のファイル名（例: Sky2023-12_header.wvh）が切れた。
+        # setSizes は表示時の実幅に比例配分されるので、比率として与える。
+        main_splitter.setSizes([200, 800])
+        # ウィンドウを広げた分もこの比率で配分する
+        main_splitter.setStretchFactor(0, 1)
+        main_splitter.setStretchFactor(1, 4)
 
         # メインスプリッターをストレッチファクター1で追加（可変高さ）
         main_layout.addWidget(main_splitter, 1)
@@ -506,7 +515,7 @@ class RSIQViewer(QMainWindow):
                 # 軸ラベルをリセット
                 with contextlib.suppress(Exception):
                     self.spectrogram_widget.plot_item.setLabel('bottom', '時間')
-                    self.spectrogram_widget.plot_item.setLabel('left', '周波数', units='MHz')
+                    self.spectrogram_widget.plot_item.setLabel('left', '周波数', units='Hz')
 
             # ========================================
             # 2. Qtイベント処理
@@ -591,7 +600,7 @@ class RSIQViewer(QMainWindow):
                 size_gb = self.wv_loader.data_file_path.stat().st_size / 1e9
                 print(f"データサイズ: {size_gb:.2f} GB")
 
-            elif file_path_obj.suffix == '.wvh':
+            elif file_path_obj.suffix in ('.wvh', '.wvd'):
                 # WVHファイル
                 print("形式: WVH/WVD")
                 self.file_type = 'wv'
@@ -599,7 +608,11 @@ class RSIQViewer(QMainWindow):
 
                 # WVHヘッダー解析
                 print("WVHヘッダーを解析中...")
-                header = self.wv_loader.parse_wvh(file_path)
+                # .wvd を選んだ場合や、名前の異なる組（X_header.wvh + X_data.wvd）も解決する
+                header = self.wv_loader.parse_wvh(resolve_wvh(file_path))
+                if self.wv_loader.wvd_path.stem != self.wv_loader.wvh_path.stem:
+                    print(f"組み合わせ: {self.wv_loader.wvh_path.name} + {self.wv_loader.wvd_path.name}"
+                          "（名前が異なるためサイズ一致で対応付け）")
 
                 # WVDファイルをメモリマップとして開く
                 print("WVDファイルをメモリマップで開いています...")
@@ -651,10 +664,6 @@ class RSIQViewer(QMainWindow):
             print(f"サンプル数: {self.total_samples:,}")
             print(f"サンプリング周波数: {self.sample_rate/1e6:.2f} MHz")
             print(f"中心周波数: {self.center_frequency/1e6:.2f} MHz")
-
-            # パンくずリストを読み込んだファイルのディレクトリに更新
-            file_dir = file_path_obj.parent
-            self.control_panel.set_breadcrumb_path(file_dir)
 
             # ステータスバーに読み込み完了を表示（詳細情報含む）
             self.status_label.setText(
@@ -974,12 +983,16 @@ class RSIQViewer(QMainWindow):
         プレビュー）に委譲する。
         """
         env = self.envelope
-        if (
-            env is not None
-            and (end_sample - start_sample) >= 2 * BASE_BIN * target_pixels
-            and env.covers(start_sample, end_sample)
-        ):
-            return env.minmax(start_sample, end_sample, target_pixels, self.sample_rate)
+        if env is not None and (end_sample - start_sample) >= 2 * BASE_BIN * target_pixels:
+            if env.covers(start_sample, end_sample):
+                return env.minmax(start_sample, end_sample, target_pixels, self.sample_rate)
+            # 構築中で未到達の範囲は、生データを大量に読まずプレビューで済ませる。
+            # 構築と同時に別の位置を読むと外部ストレージでは極端に遅くなる
+            # （1 GBのRegionで273秒）。構築完了時に正確な表示へ置き換わる。
+            with self._envelope_paused():
+                return preview_downsample(
+                    self.wv_loader.get_iq_data, start_sample, end_sample, target_pixels, self.sample_rate
+                )
         return min_max_downsample(
             self.wv_loader.get_iq_data,
             start_sample,
@@ -998,9 +1011,10 @@ class RSIQViewer(QMainWindow):
             return env.minmax(0, self.total_samples, target_pixels, self.sample_rate)
 
         if self._overview_preview is None:
-            self._overview_preview = min_max_downsample(
-                self.wv_loader.get_iq_data, 0, self.total_samples, target_pixels, self.sample_rate
-            )
+            with self._envelope_paused():
+                self._overview_preview = min_max_downsample(
+                    self.wv_loader.get_iq_data, 0, self.total_samples, target_pixels, self.sample_rate
+                )
         px, py = self._overview_preview
         done = 0 if env is None else env.valid_samples - env.valid_samples % BASE_BIN
         if done < 2 * BASE_BIN:
@@ -1030,6 +1044,18 @@ class RSIQViewer(QMainWindow):
         self._envelope_t0 = time.monotonic()
         print("[エンベロープ] バックグラウンドで構築開始（初回のみ。以後はキャッシュ）")
         worker.start()
+
+    @contextlib.contextmanager
+    def _envelope_paused(self):
+        """大量の生データを読む処理の間、エンベロープ構築を一時停止する。"""
+        worker = self._envelope_worker
+        if worker is not None:
+            worker.pause()
+        try:
+            yield
+        finally:
+            if worker is not None:
+                worker.resume()
 
     def _stop_envelope_worker(self):
         worker = getattr(self, '_envelope_worker', None)
@@ -1532,16 +1558,17 @@ class RSIQViewer(QMainWindow):
                     print(f"  進捗: {pct}% ({done:,}/{total:,} フレーム)")
                     self.status_label.setText(f"⏳ スペクトログラム計算中... {pct}%")
 
-            frequencies, times, sxx_db = compute_spectrogram_streaming(
-                self.wv_loader.get_iq_data,
-                spectrogram_start,
-                spectrogram_end,
-                nfft=nfft,
-                overlap_percent=overlap_percent,
-                window=window,
-                sample_rate=self.sample_rate,
-                progress=_report,
-            )
+            with self._envelope_paused():
+                frequencies, times, sxx_db = compute_spectrogram_streaming(
+                    self.wv_loader.get_iq_data,
+                    spectrogram_start,
+                    spectrogram_end,
+                    nfft=nfft,
+                    overlap_percent=overlap_percent,
+                    window=window,
+                    sample_rate=self.sample_rate,
+                    progress=_report,
+                )
 
             print("計算完了")
             print(f"  スペクトログラム形状: {sxx_db.shape}")
@@ -1668,10 +1695,11 @@ class RSIQViewer(QMainWindow):
 
             # IQデータ取得
             print("IQデータを読み込み中...")
-            iq_data = self.wv_loader.get_iq_data(
-                start_sample=self.region_start,
-                end_sample=self.region_end
-            )
+            with self._envelope_paused():
+                iq_data = self.wv_loader.get_iq_data(
+                    start_sample=self.region_start,
+                    end_sample=self.region_end
+                )
             print(f"データ読み込み完了: {len(iq_data):,} samples")
 
             # IQデータをint16形式に変換（WVH/WVD形式はRAW16LE）
@@ -1778,10 +1806,6 @@ class RSIQViewer(QMainWindow):
                 f"font-size: {self.font_size_large}pt; padding: 5px; color: #888888;"
             )
 
-    def _on_breadcrumb_clicked(self, path):
-        """パンくずリストのボタンが押されたら FileBrowserPanel に伝える。"""
-        self.file_browser.set_root_dir(path)
-
     def _on_auto_update_toggled(self, enabled):
         """AdjustmentPanel.auto_update_changed (bool) ハンドラ。"""
         self.auto_update_spectrogram = bool(enabled)
@@ -1794,6 +1818,8 @@ class RSIQViewer(QMainWindow):
         # ステータス再描画
         self.on_region_changed()
 
+
+    _STDERR_COLOR = "#ff6b6b"
 
     def append_stdout(self, text):
         """標準出力テキストをパネルに追加する。"""
@@ -1816,14 +1842,17 @@ class RSIQViewer(QMainWindow):
 
         try:
             body = text.rstrip()
+            # 行ごとに文字書式を明示して挿入する。append() にHTMLのspanを渡すと、
+            # 後から追加した通常の行まで直前の赤を引き継いでしまうため。
+            fmt = QTextCharFormat()
             if error:
-                # white-space:pre-wrap でトレースバックの字下げを保つ
-                escaped = html.escape(body)
-                self.stdout_text.append(
-                    f'<span style="color:#ff6b6b; white-space:pre-wrap;">{escaped}</span>'
-                )
-            else:
-                self.stdout_text.append(body)
+                fmt.setForeground(QColor(self._STDERR_COLOR))
+            doc = self.stdout_text.document()
+            cursor = QTextCursor(doc)
+            cursor.movePosition(QTextCursor.End)
+            if not doc.isEmpty():
+                cursor.insertBlock(QTextBlockFormat(), fmt)
+            cursor.insertText(body, fmt)  # プレーンテキストなので字下げもそのまま
 
             # 自動スクロール（最新の出力が常に表示される）
             cursor = self.stdout_text.textCursor()

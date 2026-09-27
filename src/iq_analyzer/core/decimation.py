@@ -80,7 +80,7 @@ def min_max_downsample(
     )
 
     if total_samples // max(1, target_pixels) > _CHUNK_SIZE:
-        return _preview_downsample(get_iq_data, start_sample, end_sample, target_pixels, sample_rate)
+        return preview_downsample(get_iq_data, start_sample, end_sample, target_pixels, sample_rate)
 
     bin_size = max(1, total_samples // target_pixels)
     x_mins: list[float] = []
@@ -116,7 +116,7 @@ def min_max_downsample(
     return x_data, y_data
 
 
-def _preview_downsample(
+def preview_downsample(
     get_iq_data: IQGetter,
     start_sample: int,
     end_sample: int,

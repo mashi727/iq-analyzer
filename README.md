@@ -70,7 +70,7 @@ uv run iq-analyzer
 ## 使い方
 
 1. 左ペインのファイルブラウザから IQ ファイルをダブルクリックで開く
-   (`.wvh`, `.wv`, `.iq.tar`, または `.bin.txt` を伴う `.bin`)。外部ストレージはファイルブラウザ上部の「ストレージを選択…」から開けます
+   (`.wvh`, `.wv`, `.iq.tar`, または `.bin.txt` を伴う `.bin`)。外部ストレージはファイルブラウザの「この Mac」（Windows では「PC」）の下に並びます
 2. 下段の Overview で青い線形 Region をドラッグして関心範囲を選択
 3. **📊 スペクトログラム計算** ボタン (or 「Region 変更時に自動更新」 ON) で
    2D スペクトログラムを描画
@@ -104,7 +104,6 @@ src/iq_analyzer/
 ├── widgets/
 │   ├── spectrogram.py     # SpectrogramWidget + max_pool_2d
 │   ├── file_browser.py    # FileBrowserPanel (QTreeView + プレビュー)
-│   ├── breadcrumb.py      # BreadcrumbBar
 │   ├── control_panel.py   # トップバー (計算/保存/終了)
 │   └── adjustment_panel.py # 表示設定
 └── ui/main_window.py      # RSIQViewer (3 プロット同期)

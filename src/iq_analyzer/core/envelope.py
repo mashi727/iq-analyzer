@@ -210,14 +210,24 @@ def build_envelope(
     *,
     progress: Callable[[int, int], None] | None = None,
     cancel: threading.Event | None = None,
+    resume: threading.Event | None = None,
 ) -> bool:
-    """Fill ``envelope`` with one sequential pass. Returns False if cancelled."""
+    """Fill ``envelope`` with one sequential pass. Returns False if cancelled.
+
+    While ``resume`` is cleared the pass waits between chunks. The GUI clears
+    it around its own bulk reads (spectrogram, save): two concurrent streams
+    at distant offsets on one external drive measured 90× slower than either
+    alone (273 s to read a 1 GB region during a build).
+    """
     read_power = _power_reader(loader)
     scale = envelope.amplitude_scale
     n = envelope.n_samples
     chunk = _BINS_PER_CHUNK * BASE_BIN
 
     for start in range(0, n, chunk):
+        while resume is not None and not resume.wait(0.1):
+            if cancel is not None and cancel.is_set():
+                return False
         if cancel is not None and cancel.is_set():
             return False
         end = min(start + chunk, n)

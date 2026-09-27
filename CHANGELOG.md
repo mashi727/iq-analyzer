@@ -23,10 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Streaming spectrogram (`compute_spectrogram_streaming`): the region is read
   and transformed in batches, and frames beyond 4096 columns are max-pooled in
   time, so memory no longer grows with region length.
-- Storage selector in the file browser listing mounted volumes (`/Volumes/*`
-  on macOS, drives on Windows, `/media` `/mnt` on Linux), refreshed each time
-  it opens. `/Volumes` is a hidden directory on macOS, so external drives were
-  previously unreachable from the tree.
+- File browser rebuilt as an Explorer-style tree, ported from book-viewer:
+  `..` (re-root one level up), the start folder, ホーム, and この Mac / PC
+  listing the boot disk and external/network drives (`/Volumes` is hidden on
+  macOS, so external drives were previously unreachable). Folders load lazily
+  and are watched for changes; drive plug/unplug updates the list. Only
+  folders and IQ files are shown. Single click previews the header, double
+  click loads. Tree and header preview share a vertical splitter.
 - The output panel now also shows `sys.stderr` (tracebacks, Python warnings)
   and `iq_analyzer` log records at WARNING and above, in red. Previously only
   stdout was captured, so failures such as an envelope-cache write error were
@@ -39,11 +42,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Removed the breadcrumb bar; the tree's `..` and top-level entries replace it.
 - The initial region is the central 10% capped at 2^28 samples (1 GB of int16),
   so the first spectrogram of a 100 GB file no longer takes minutes.
 
 ### Fixed
 
+- Spectrogram frequency axis read "kMHz" for RF recordings (3.1 GHz): values
+  were plotted in MHz with units fixed to "MHz", and pyqtgraph's SI prefix
+  stacked on top. The axis is now in Hz and shows GHz or MHz as appropriate.
+- Output panel: after the first stderr line, every later stdout line was also
+  red (appended HTML carried its colour forward). Each line now gets an
+  explicit character format.
+- Envelope progress signal was declared `Signal(int, int)`, a 32-bit C int in
+  PySide6; files beyond 2^31 samples (~8.6 GB) flooded stderr with
+  `OverflowError` and the overview/progress never updated. Now `qlonglong`.
+- Opening a 121 GB WVD on an external drive took 273 s: the initial region
+  (1 GB) was read in full while the envelope build streamed from another
+  offset of the same drive. Ranges the envelope has not reached yet now use
+  the bounded preview, and the build pauses during previews, spectrogram
+  computation and region save. Measured: open 1.55 s; spectrogram of the
+  initial region mid-build 10.6 s.
+- WVH/WVD pairs with different names (e.g. `X_header.wvh` + `X_data.wvd`)
+  failed with "WVDファイルが見つかりません". The data file is now matched by
+  same stem, else by exact size (`SAMPLES × 4`), else as the folder's only
+  pair; ambiguous folders list the candidates. `.wvd` files are shown in the
+  file browser and can be opened directly (the header is found the same way).
 - Overview decimation read the *whole* file on every full-span redraw: its
   "sub-sampling" branch read each bin in full before sub-sampling. Wide ranges
   without an envelope now use a bounded preview (≤ 512 reads of 64 Ki samples).

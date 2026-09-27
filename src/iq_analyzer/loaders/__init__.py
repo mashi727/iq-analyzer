@@ -13,7 +13,7 @@ from iq_analyzer.loaders.base import IQLoader
 from iq_analyzer.loaders.iqtar import IQTarLoader
 from iq_analyzer.loaders.keysight import KeysightBinLoader
 from iq_analyzer.loaders.smuwv import SMUWVLoader
-from iq_analyzer.loaders.wv import WVFileLoader
+from iq_analyzer.loaders.wv import WVFileLoader, resolve_wvh
 
 __all__ = [
     "IQLoader",
@@ -47,7 +47,7 @@ def open_iq_file(path: str | Path) -> IQLoader:
 
     if path.suffix.lower() in {".wvh", ".wvd"}:
         wv_loader = WVFileLoader()
-        wv_loader.parse_wvh(path.with_suffix(".wvh"))
+        wv_loader.parse_wvh(resolve_wvh(path))
         wv_loader.open_wvd()
         return wv_loader
 

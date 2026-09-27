@@ -105,9 +105,27 @@ def test_stderr_and_logging_reach_output_panel(qapp) -> None:
         assert "plain stdout line" in text
         assert "stderr line" in text
         assert "[WARNING] iq_analyzer.test: from thread" in text
-        # Errors are rendered in red; stdout stays unstyled.
-        rich = viewer.stdout_text.toHtml()
-        assert "#ff6b6b" in rich
+        # Errors are red; stdout lines — including those printed *after* an
+        # error — keep the default colour (regression: they inherited red).
+        print("stdout after error")
+        qapp.processEvents()
+
+        from PySide6.QtGui import QTextFormat
+
+        def colour_of(fragment: str) -> str | None:
+            block = viewer.stdout_text.document().begin()
+            while block.isValid():
+                if fragment in block.text():
+                    it = block.begin()
+                    fmt = it.fragment().charFormat()
+                    return fmt.foreground().color().name() if fmt.hasProperty(QTextFormat.Property.ForegroundBrush) else None
+                block = block.next()
+            raise AssertionError(fragment)
+
+        assert colour_of("stderr line") == "#ff6b6b"
+        assert colour_of("from thread") == "#ff6b6b"
+        assert colour_of("plain stdout line") is None
+        assert colour_of("stdout after error") is None
     finally:
         viewer.close()
 

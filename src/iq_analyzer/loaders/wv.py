@@ -29,6 +29,71 @@ logger = logging.getLogger(__name__)
 
 _HEADER_PATTERN = re.compile(r"\{([^:]+):([^}]+)\}")
 _REQUIRED_KEYS = ("TYPE", "SAMPLES", "CLOCK")
+_BYTES_PER_SAMPLE = 4  # int16 I + int16 Q
+
+
+def _declared_samples(wvh_path: Path) -> int | None:
+    try:
+        header = dict(_HEADER_PATTERN.findall(wvh_path.read_text(encoding="utf-8", errors="ignore")))
+        return int(header["SAMPLES"])
+    except (OSError, KeyError, ValueError):
+        return None
+
+
+def _pick(candidates: list[Path], what: str, anchor: Path) -> Path:
+    if len(candidates) == 1:
+        return candidates[0]
+    names = ", ".join(sorted(c.name for c in candidates)) or "なし"
+    raise FileNotFoundError(
+        f"{anchor.name} に対応する{what}を特定できません（候補: {names}）。"
+        f"同じファイル名にそろえてください"
+    )
+
+
+def find_wvd_for_wvh(wvh_path: Path, samples: int) -> Path:
+    """Locate the data file belonging to *wvh_path*.
+
+    The instrument writes ``name.wvh`` + ``name.wvd``, but renamed recordings
+    (e.g. ``X_header.wvh`` + ``X_data.wvd``) are common. Rules, in order:
+
+    1. same stem;
+    2. the only ``.wvd`` in the folder whose size is exactly ``SAMPLES × 4``;
+    3. the folder holds exactly one ``.wvh`` and one ``.wvd`` (size mismatch is
+       then reported by :meth:`WVFileLoader.open_wvd` as usual).
+    """
+    same = wvh_path.with_suffix(".wvd")
+    if same.exists():
+        return same
+    folder = wvh_path.parent
+    wvds = [p for p in folder.glob("*.wvd") if p.is_file()]
+    by_size = [p for p in wvds if p.stat().st_size == samples * _BYTES_PER_SAMPLE]
+    if len(by_size) == 1:
+        return by_size[0]
+    if len(wvds) == 1 and len(list(folder.glob("*.wvh"))) == 1:
+        return wvds[0]
+    return _pick(by_size or wvds, "WVDファイル", wvh_path)
+
+
+def find_wvh_for_wvd(wvd_path: Path) -> Path:
+    """Inverse of :func:`find_wvd_for_wvh`: the header describing *wvd_path*."""
+    same = wvd_path.with_suffix(".wvh")
+    if same.exists():
+        return same
+    folder = wvd_path.parent
+    size = wvd_path.stat().st_size
+    wvhs = [p for p in folder.glob("*.wvh") if p.is_file()]
+    by_size = [p for p in wvhs if (_declared_samples(p) or -1) * _BYTES_PER_SAMPLE == size]
+    if len(by_size) == 1:
+        return by_size[0]
+    if len(wvhs) == 1 and len(list(folder.glob("*.wvd"))) == 1:
+        return wvhs[0]
+    return _pick(by_size or wvhs, "WVHファイル", wvd_path)
+
+
+def resolve_wvh(path: str | Path) -> Path:
+    """Accept either half of a pair and return the ``.wvh`` to parse."""
+    path = Path(path)
+    return find_wvh_for_wvd(path) if path.suffix.lower() == ".wvd" else path
 
 
 class WVFileLoader:
@@ -72,10 +137,10 @@ class WVFileLoader:
         header["REFLEVEL"] = float(header.get("REFLEVEL", 0.0))
 
         self.header = header
-        self.wvd_path = wvh_path.with_suffix(".wvd")
-
-        if not self.wvd_path.exists():
-            raise FileNotFoundError(f"WVDファイルが見つかりません: {self.wvd_path}")
+        self.wvd_path = find_wvd_for_wvh(wvh_path, header["SAMPLES"])
+        if self.wvd_path.stem != wvh_path.stem:
+            logger.info("WVHとWVDの名前が異なるため、サイズ一致で対応付けました: %s ↔ %s",
+                        wvh_path.name, self.wvd_path.name)
 
         return header
 

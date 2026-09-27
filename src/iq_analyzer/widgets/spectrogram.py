@@ -142,7 +142,10 @@ class SpectrogramWidget(QWidget):
 
         self.graphics_widget = pg.GraphicsLayoutWidget()
         self.plot_item = self.graphics_widget.addPlot()
-        self.plot_item.setLabel("left", "周波数 (MHz)")
+        # Plot in Hz and let pyqtgraph pick the SI prefix: GHz for an RF centre
+        # frequency, MHz for baseband. (Fixing units="MHz" made the auto prefix
+        # render "kMHz" for 3.1 GHz recordings.)
+        self.plot_item.setLabel("left", "周波数", units="Hz")
         self.plot_item.setLabel("bottom", "時間")
         self.plot_item.showGrid(x=True, y=True, alpha=0.3)
 
@@ -175,10 +178,10 @@ class SpectrogramWidget(QWidget):
         """Repaint the spectrogram with new data.
 
         ``frequencies`` is in Hz (baseband); ``center_freq`` is added before
-        display so the y-axis shows absolute frequency in MHz. The widget picks
+        display so the y-axis shows absolute frequency (in Hz, SI-prefixed). The widget picks
         a sensible time-axis unit (s/ms/μs/ns) based on the maximum value.
         """
-        freq_mhz = (frequencies + center_freq) / 1e6
+        freq_hz = frequencies + center_freq
 
         if times[-1] < 1e-6:
             time_scale = times * 1e9
@@ -193,7 +196,7 @@ class SpectrogramWidget(QWidget):
             time_scale = times
             time_unit = "s"
 
-        self.frequencies = freq_mhz
+        self.frequencies = freq_hz
         self.times = time_scale
         self.time_unit = time_unit
         self.spectrogram_data = sxx_db
@@ -216,12 +219,12 @@ class SpectrogramWidget(QWidget):
             levels=(min_level, max_level),
         )
 
-        if len(time_scale) > 1 and len(freq_mhz) > 1:
+        if len(time_scale) > 1 and len(freq_hz) > 1:
             rect = QRectF(
                 float(time_scale[0]),
-                float(freq_mhz[0]),
+                float(freq_hz[0]),
                 float(time_scale[-1] - time_scale[0]),
-                float(freq_mhz[-1] - freq_mhz[0]),
+                float(freq_hz[-1] - freq_hz[0]),
             )
             self.img_item.setRect(rect)
 
@@ -235,7 +238,9 @@ class SpectrogramWidget(QWidget):
         self.plot_item.setLabel("bottom", "時間", units=time_unit)
 
         time_duration = float(time_scale[-1] - time_scale[0])
-        freq_range = float(freq_mhz[-1] - freq_mhz[0])
+        # The stretch heuristic below was tuned with the frequency span in MHz
+        # against the time span in its display unit; keep it in MHz.
+        freq_range = float(freq_hz[-1] - freq_hz[0]) / 1e6
         # Stretch the time axis for very short pulses so the spectrogram
         # doesn't collapse into a vertical sliver.
         min_time_width = freq_range * 0.1
@@ -243,7 +248,7 @@ class SpectrogramWidget(QWidget):
             time_center = (float(time_scale[0]) + float(time_scale[-1])) / 2
             self.plot_item.setRange(
                 xRange=(time_center - min_time_width / 2, time_center + min_time_width / 2),
-                yRange=(float(freq_mhz[0]), float(freq_mhz[-1])),
+                yRange=(float(freq_hz[0]), float(freq_hz[-1])),
                 padding=0,
             )
             logger.debug(

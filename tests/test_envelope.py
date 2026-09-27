@@ -115,3 +115,36 @@ def test_generic_path_for_float_loaders() -> None:
     env = Envelope(3 * BASE_BIN)
     build_envelope(FloatLoader(), env)
     np.testing.assert_allclose(env.amp_max, 5.0)
+
+
+def test_build_waits_while_paused_then_finishes(tmp_path: Path) -> None:
+    n = 3 * 1024 * BASE_BIN
+    path, _ = _recording(tmp_path, n)
+    loader = open_iq_file(path)
+    env = Envelope(n)
+    resume = threading.Event()  # starts paused
+    t = threading.Thread(target=build_envelope, args=(loader, env), kwargs={"resume": resume})
+    t.start()
+    t.join(0.5)
+    assert t.is_alive() and env.valid_samples == 0  # held before the first chunk
+
+    resume.set()
+    t.join(30)
+    assert not t.is_alive() and env.complete
+    loader.close()
+
+
+def test_cancel_releases_a_paused_build(tmp_path: Path) -> None:
+    n = 2 * 1024 * BASE_BIN
+    path, _ = _recording(tmp_path, n)
+    loader = open_iq_file(path)
+    cancel, resume = threading.Event(), threading.Event()
+    result: list[bool] = []
+    t = threading.Thread(
+        target=lambda: result.append(build_envelope(loader, Envelope(n), cancel=cancel, resume=resume))
+    )
+    t.start()
+    cancel.set()
+    t.join(5)
+    assert result == [False]
+    loader.close()
