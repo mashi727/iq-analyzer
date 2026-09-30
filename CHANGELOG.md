@@ -52,6 +52,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Empty-state axes read "周波数 (mHz)", "時間 (x0.001)" and "時間 (ks)": the
+  default ±0.5 view of an empty plot was SI-prefixed, and the overview region
+  started at (0, 100000) s. Empty plots now carry no units; manually scaled
+  time axes (spectrogram, region) no longer get a second SI prefix; the
+  initial region is (0, 1) s.
 - Spectrogram frequency axis read "kMHz" for RF recordings (3.1 GHz): values
   were plotted in MHz with units fixed to "MHz", and pyqtgraph's SI prefix
   stacked on top. The axis is now in Hz and shows GHz or MHz as appropriate.

@@ -230,3 +230,40 @@ def test_file_browser_reveal_through_symlinked_path(qapp, tmp_path: Path) -> Non
     panel = FileBrowserPanel(folder)
     assert panel.reveal(link / "rec" / "b.wv")
     assert panel.tree.currentItem().text(0) == "b.wv"
+
+
+def _axis_label(plot_item, side: str) -> str:
+    import re
+
+    return re.sub(r"<[^>]+>", "", plot_item.getAxis(side).labelString()).strip()
+
+
+def test_spectrogram_axes_empty_then_rf_then_baseband(qapp) -> None:
+    import numpy as np
+
+    from iq_analyzer.widgets.spectrogram import SpectrogramWidget
+
+    w = SpectrogramWidget()
+    w.resize(600, 400)
+    w.show()
+    qapp.processEvents()
+    # Empty: no misleading "(mHz)" / "(x0.001)".
+    assert _axis_label(w.plot_item, "left") == "周波数"
+    assert _axis_label(w.plot_item, "bottom") == "時間"
+
+    f = np.fft.fftshift(np.fft.fftfreq(256, 1 / 250e6))
+    t = 60 + np.arange(64) * 1e-3
+    img = np.zeros((256, 64), dtype=np.float32)
+
+    w.update_spectrogram(f, t, img, center_freq=3.175e9)
+    qapp.processEvents()
+    assert _axis_label(w.plot_item, "left") == "周波数 (GHz)"
+    assert _axis_label(w.plot_item, "bottom") == "時間 (s)"
+
+    w.update_spectrogram(f, t - 60, img, center_freq=0.0)  # < 1 s -> ms
+    qapp.processEvents()
+    assert _axis_label(w.plot_item, "left") == "周波数 (MHz)"
+    assert _axis_label(w.plot_item, "bottom") == "時間 (ms)"
+
+    w.clear_axes()
+    assert _axis_label(w.plot_item, "left") == "周波数"

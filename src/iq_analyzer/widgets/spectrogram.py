@@ -142,11 +142,10 @@ class SpectrogramWidget(QWidget):
 
         self.graphics_widget = pg.GraphicsLayoutWidget()
         self.plot_item = self.graphics_widget.addPlot()
-        # Plot in Hz and let pyqtgraph pick the SI prefix: GHz for an RF centre
-        # frequency, MHz for baseband. (Fixing units="MHz" made the auto prefix
-        # render "kMHz" for 3.1 GHz recordings.)
-        self.plot_item.setLabel("left", "周波数", units="Hz")
-        self.plot_item.setLabel("bottom", "時間")
+        # Time values are already scaled to s/ms/μs/ns by update_spectrogram, so
+        # pyqtgraph must not stack its own SI prefix on top ("kms", "(x0.001)").
+        self.plot_item.getAxis("bottom").enableAutoSIPrefix(False)
+        self.clear_axes()
         self.plot_item.showGrid(x=True, y=True, alpha=0.3)
 
         self.img_item = pg.ImageItem()
@@ -159,6 +158,17 @@ class SpectrogramWidget(QWidget):
 
         layout.addWidget(self.graphics_widget)
         self.setLayout(layout)
+
+    def clear_axes(self) -> None:
+        """Axis labels for the empty state: no units, no SI prefix.
+
+        With units set, the default ±0.5 view of an empty plot is rendered as
+        "周波数 (mHz)" / "時間 (x0.001)", which reads as a real (and absurd) scale.
+        """
+        left = self.plot_item.getAxis("left")
+        left.enableAutoSIPrefix(False)
+        self.plot_item.setLabel("left", "周波数")
+        self.plot_item.setLabel("bottom", "時間")
 
     def set_colormap(self, colormap_name: str) -> None:
         """Apply one of :data:`AVAILABLE_COLORMAPS`. Unknown names are ignored."""
@@ -182,6 +192,11 @@ class SpectrogramWidget(QWidget):
         a sensible time-axis unit (s/ms/μs/ns) based on the maximum value.
         """
         freq_hz = frequencies + center_freq
+        # Plot in Hz and let pyqtgraph pick the SI prefix: GHz for an RF centre
+        # frequency, MHz for baseband. (Fixing units="MHz" made the auto prefix
+        # render "kMHz" for 3.1 GHz recordings.)
+        self.plot_item.getAxis("left").enableAutoSIPrefix(True)
+        self.plot_item.setLabel("left", "周波数", units="Hz")
 
         if times[-1] < 1e-6:
             time_scale = times * 1e9

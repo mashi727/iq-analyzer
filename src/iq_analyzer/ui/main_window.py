@@ -235,6 +235,9 @@ class RSIQViewer(QMainWindow):
         self.region_plot = pg.PlotWidget()
         self.region_plot.setLabel('left', '振幅')
         self.region_plot.setLabel('bottom', '時間', units='s')
+        # 時間は update_region_waveform で s/ms/μs に換算済み。pyqtgraph の
+        # SI接頭辞を重ねない（重ねると "kms" や "(x0.001)" になる）
+        self.region_plot.getAxis('bottom').enableAutoSIPrefix(False)
         self.region_plot.showGrid(x=True, y=True, alpha=0.3)
         self.region_plot.setTitle("Region範囲 時間-振幅波形")
         self.region_plot.setMinimumHeight(150)  # 最小高さ150px（マウス拡大で潰れないように）
@@ -287,8 +290,9 @@ class RSIQViewer(QMainWindow):
         self.overview_viewbox.sigRangeChanged.connect(self.on_overview_range_changed)
 
         # Region選択
+        # 初期値は (0, 1) 秒。(0, 100000) だと空の全体波形の軸が 0〜100 ks になっていた
         self.region = pg.LinearRegionItem(
-            values=(0, 100000),
+            values=(0, 1),
             brush=(100, 100, 255, 30),
             pen=pg.mkPen('b', width=2)
         )
@@ -514,8 +518,7 @@ class RSIQViewer(QMainWindow):
                         self.spectrogram_widget.img_item.setImage(empty_data)
                 # 軸ラベルをリセット
                 with contextlib.suppress(Exception):
-                    self.spectrogram_widget.plot_item.setLabel('bottom', '時間')
-                    self.spectrogram_widget.plot_item.setLabel('left', '周波数', units='Hz')
+                    self.spectrogram_widget.clear_axes()
 
             # ========================================
             # 2. Qtイベント処理
