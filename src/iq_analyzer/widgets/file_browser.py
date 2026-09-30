@@ -440,13 +440,15 @@ class FileBrowserPanel(QWidget):
 
         Without *under*, walks from the deepest top-level entry containing it.
         """
-        target = Path(path)
+        # Compare real paths: on macOS /tmp is /private/tmp, /Volumes/MacHD is /,
+        # and the same folder may be reached through either spelling.
+        target = Path(os.path.realpath(path))
         best: tuple[int, QTreeWidgetItem] | None = None
         for item in [under] if under is not None else self._all_roots():
             p = item.data(0, _PATH_ROLE)
             if p is None:
                 continue
-            base = Path(p)
+            base = Path(os.path.realpath(p))
             if target == base or base in target.parents:
                 depth = len(base.parts)
                 if best is None or depth > best[0]:
@@ -454,7 +456,7 @@ class FileBrowserPanel(QWidget):
         if best is None:
             return False
         item = best[1]
-        base = Path(item.data(0, _PATH_ROLE))
+        base = Path(os.path.realpath(item.data(0, _PATH_ROLE)))
         for part in target.relative_to(base).parts:
             self._ensure_loaded(item)
             item.setExpanded(True)

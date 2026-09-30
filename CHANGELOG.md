@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `scripts/generate_demo_iq.py`: synthetic WVH/WVD demo capture (frequency
+  hopper, two CW carriers, pulsed LFM radar with a scan pattern, wideband
+  bursts; Fc 5.8 GHz, 100 MS/s) so the viewer can be tried without instrument
+  data. README screenshots (`docs/images/`) are taken from it.
 - Rohde & Schwarz ARB waveform files (`.wv`, `{TYPE: SMU-WV}`) via the new
   `SMUWVLoader`. The single-file layout (ASCII tags + `{WAVEFORM-n:#...}` int16
   payload) is memory-mapped at the payload offset. Both `WAVEFORM` and

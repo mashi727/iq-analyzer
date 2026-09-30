@@ -220,3 +220,13 @@ def test_file_browser_picks_up_new_files(qapp, tmp_path: Path) -> None:
     panel._on_dir_changed(str(folder))
     panel._refresh_dirty()
     assert "c.wv" in _tree_labels(panel._start_item)
+
+
+def test_file_browser_reveal_through_symlinked_path(qapp, tmp_path: Path) -> None:
+    """/tmp vs /private/tmp on macOS: reveal must match the real path."""
+    folder = _make_iq_folder(tmp_path / "real")
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "real")
+    panel = FileBrowserPanel(folder)
+    assert panel.reveal(link / "rec" / "b.wv")
+    assert panel.tree.currentItem().text(0) == "b.wv"
