@@ -15,16 +15,6 @@ from PySide6.QtWidgets import QApplication
 
 logger = logging.getLogger(__name__)
 
-# Optional dark-theme dependency. The viewer works fine without it; we just
-# fall back to the platform default.
-try:
-    import qdarktheme  # type: ignore[import-not-found]
-
-    _HAS_DARKTHEME = True
-except ImportError:  # pragma: no cover - optional dep
-    qdarktheme = None  # type: ignore[assignment]
-    _HAS_DARKTHEME = False
-
 
 def _platform_font_size() -> int:
     """Smaller font on Windows so the dense UI fits 1080p, larger on macOS/Linux."""
@@ -46,11 +36,13 @@ def main(argv: list[str] | None = None) -> int:
     font.setPointSize(_platform_font_size())
     app.setFont(font)
 
-    if _HAS_DARKTHEME:
-        try:
-            app.setStyleSheet(qdarktheme.load_stylesheet())
-        except Exception as exc:  # pragma: no cover - defensive
-            logger.warning("qdarktheme.load_stylesheet failed: %s", exc)
+    # Built-in flat dark theme (ui.style). qdarktheme is no longer layered
+    # underneath: when installed, its sheet set backgrounds (#202124), frame
+    # lines (#3f4042) and group-box/splitter padding that ours did not
+    # override, which left 5–7 px gaps around every pane.
+    from iq_analyzer.ui.style import apply_theme
+
+    apply_theme(app)
 
     # Imported lazily so ``--help`` (etc., in the future) is cheap and so
     # widget creation only happens after the QApplication exists.

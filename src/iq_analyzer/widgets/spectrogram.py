@@ -8,8 +8,10 @@ from typing import Any
 import numpy as np
 import pyqtgraph as pg
 from numpy.typing import NDArray
-from PySide6.QtCore import QRectF
+from PySide6.QtCore import QRectF, Signal
 from PySide6.QtWidgets import QVBoxLayout, QWidget
+
+from iq_analyzer.ui.style import style_plot
 
 logger = logging.getLogger(__name__)
 
@@ -116,6 +118,9 @@ def auto_color_levels(sxx_db: NDArray[np.floating]) -> tuple[float, float]:
     return lower, upper
 
 
+_TIME_FACTORS = {"s": 1.0, "ms": 1e3, "μs": 1e6, "ns": 1e9}
+
+
 class SpectrogramWidget(QWidget):
     """Spectrogram display with adaptive color scaling and downsampling.
 
@@ -123,7 +128,13 @@ class SpectrogramWidget(QWidget):
     :class:`pyqtgraph.HistogramLUTItem`; callers feed it ``(frequencies, times,
     sxx_db)`` via :meth:`update_spectrogram` and the widget handles the rest
     (downsampling for the current viewport, color scaling, axis units).
+
+    A rectangular selection (``selection_roi``) marks a time × frequency
+    range, e.g. for envelope playback; :meth:`selection` returns it in
+    absolute seconds and Hz.
     """
+
+    selection_changed = Signal()
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -136,6 +147,81 @@ class SpectrogramWidget(QWidget):
         self.current_max_level: float | None = None
         self._init_ui()
 
+    # ------------------------------------------------------------ selection
+
+    def _init_selection(self) -> None:
+        # Plain ROI rather than RectROI: RectROI always puts its corner
+        # handle at the top-right. The corner handle sits at the bottom-right
+        # (ROI-relative (1, 0): the frequency axis points up) and scales about
+        # the top-left corner.
+        self.selection_roi = pg.ROI(
+            [0, 0], [1, 1], pen=pg.mkPen((0, 255, 255), width=2), hoverPen=pg.mkPen((255, 255, 255), width=2)
+        )
+        self.selection_roi.addScaleHandle([1, 0], [0, 1])
+        # Edge handles so time and band can be adjusted independently.
+        for pos, center in (([0, 0.5], [1, 0.5]), ([1, 0.5], [0, 0.5]), ([0.5, 0], [0.5, 1]), ([0.5, 1], [0.5, 0])):
+            self.selection_roi.addScaleHandle(pos, center)
+        self.selection_roi.setZValue(20)
+        self.selection_roi.hide()
+        self.selection_roi.sigRegionChangeFinished.connect(lambda *_: self.selection_changed.emit())
+        self.plot_item.addItem(self.selection_roi)
+
+        self.playhead = pg.InfiniteLine(angle=90, pen=pg.mkPen((255, 255, 255), width=2))
+        self.playhead.setZValue(30)
+        self.playhead.hide()
+        self.plot_item.addItem(self.playhead)
+
+    def _image_extent(self) -> tuple[float, float, float, float] | None:
+        """(x0, x1, y0, y1) of the current image in display units."""
+        if self.times is None or self.frequencies is None or len(self.times) < 2:
+            return None
+        return (float(self.times[0]), float(self.times[-1]), float(self.frequencies[0]), float(self.frequencies[-1]))
+
+    def _place_selection(self, prev: tuple[float, float, float, float] | None) -> None:
+        """Keep the user's rectangle if it still lies on the new image, else
+        reset it to the whole image (after a new Region, the old one is stale)."""
+        ext = self._image_extent()
+        if ext is None:
+            self.selection_roi.hide()
+            return
+        x0, x1, y0, y1 = ext
+        k = _TIME_FACTORS.get(self.time_unit, 1.0)
+        if prev is not None and x0 <= prev[0] * k and prev[1] * k <= x1 and y0 <= prev[2] and prev[3] <= y1:
+            # Re-express in the (possibly changed) time unit.
+            t0, t1, f0, f1 = prev
+            self.selection_roi.setPos([t0 * k, f0], finish=False)
+            self.selection_roi.setSize([(t1 - t0) * k, f1 - f0], finish=False)
+        else:
+            self.selection_roi.setPos([x0, y0], finish=False)
+            self.selection_roi.setSize([x1 - x0, y1 - y0], finish=False)
+        self.selection_roi.show()
+        self.selection_changed.emit()
+
+    def selection(self) -> tuple[float, float, float, float] | None:
+        """(t0 s, t1 s, f0 Hz, f1 Hz), absolute and clipped to the image; None if empty."""
+        ext = self._image_extent()
+        if ext is None:
+            return None
+        x0, x1, y0, y1 = ext
+        pos = self.selection_roi.pos()
+        size = self.selection_roi.size()
+        ax0, ax1 = sorted((pos.x(), pos.x() + size.x()))
+        ay0, ay1 = sorted((pos.y(), pos.y() + size.y()))
+        ax0, ax1 = max(ax0, x0), min(ax1, x1)
+        ay0, ay1 = max(ay0, y0), min(ay1, y1)
+        if ax1 <= ax0 or ay1 <= ay0:
+            return None
+        k = _TIME_FACTORS.get(self.time_unit, 1.0)
+        return ax0 / k, ax1 / k, ay0, ay1
+
+    def set_playhead(self, t_s: float | None) -> None:
+        """Show a vertical line at absolute time ``t_s`` (None hides it)."""
+        if t_s is None or self.times is None:
+            self.playhead.hide()
+            return
+        self.playhead.setPos(t_s * _TIME_FACTORS.get(self.time_unit, 1.0))
+        self.playhead.show()
+
     def _init_ui(self) -> None:
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -146,7 +232,7 @@ class SpectrogramWidget(QWidget):
         # pyqtgraph must not stack its own SI prefix on top ("kms", "(x0.001)").
         self.plot_item.getAxis("bottom").enableAutoSIPrefix(False)
         self.clear_axes()
-        self.plot_item.showGrid(x=True, y=True, alpha=0.3)
+        style_plot(self.plot_item)
 
         self.img_item = pg.ImageItem()
         self.plot_item.addItem(self.img_item)
@@ -155,6 +241,8 @@ class SpectrogramWidget(QWidget):
         self.hist.setImageItem(self.img_item)
 
         self.set_colormap("plasma")
+
+        self._init_selection()
 
         layout.addWidget(self.graphics_widget)
         self.setLayout(layout)
@@ -165,6 +253,9 @@ class SpectrogramWidget(QWidget):
         With units set, the default ±0.5 view of an empty plot is rendered as
         "周波数 (mHz)" / "時間 (x0.001)", which reads as a real (and absurd) scale.
         """
+        if hasattr(self, "selection_roi"):
+            self.selection_roi.hide()
+            self.playhead.hide()
         left = self.plot_item.getAxis("left")
         left.enableAutoSIPrefix(False)
         self.plot_item.setLabel("left", "周波数")
@@ -191,6 +282,8 @@ class SpectrogramWidget(QWidget):
         display so the y-axis shows absolute frequency (in Hz, SI-prefixed). The widget picks
         a sensible time-axis unit (s/ms/μs/ns) based on the maximum value.
         """
+        # Selection in absolute units, read before the axes change.
+        prev = self.selection() if self.selection_roi.isVisible() else None
         freq_hz = frequencies + center_freq
         # Plot in Hz and let pyqtgraph pick the SI prefix: GHz for an RF centre
         # frequency, MHz for baseband. (Fixing units="MHz" made the auto prefix
@@ -251,6 +344,7 @@ class SpectrogramWidget(QWidget):
         self.current_display_db = sxx_display
 
         self.plot_item.setLabel("bottom", "時間", units=time_unit)
+        self._place_selection(prev)
 
         time_duration = float(time_scale[-1] - time_scale[0])
         # The stretch heuristic below was tuned with the frequency span in MHz

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import math
 import os
 import sys
 import time
@@ -26,6 +27,7 @@ from PySide6.QtGui import (
     QTextBlockFormat,
     QTextCharFormat,
     QTextCursor,
+    QTextDocument,
 )
 from PySide6.QtWidgets import (
     QApplication,
@@ -61,6 +63,16 @@ from iq_analyzer.core.spectrogram import MAX_COLUMNS, spectrogram_columns
 from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, SMUWVLoader, WVFileLoader
 from iq_analyzer.loaders.wv import resolve_wvh
 from iq_analyzer.ui.envelope_worker import EnvelopeWorker
+from iq_analyzer.ui.style import (
+    ERROR,
+    LINE,
+    PANE_MARGIN,
+    PANE_SPACING,
+    SPLITTER_HANDLE,
+    SURFACE,
+    TEXT,
+    style_plot,
+)
 from iq_analyzer.widgets import (
     AdjustmentPanel,
     ControlPanel,
@@ -69,6 +81,10 @@ from iq_analyzer.widgets import (
 )
 
 __all__ = ["RSIQViewer"]
+
+INITIAL_WINDOW_SIZE = (1972, 1440)
+# 最下部のログ欄の行数（6 行。表示調整パネルは 2 列 3 段でこの高さに収まる）
+STDOUT_LINES = 6
 
 
 # === RSIQViewer class body (verbatim from the legacy rs_iq_viewer.py) ===
@@ -130,7 +146,7 @@ class RSIQViewer(QMainWindow):
             self.button_height = 35          # ボタン高さ
             self.control_panel_height = 45   # コントロールパネル高さ
             # 標準出力: 10行分の高さ（行間1.5倍を考慮）
-            self.stdout_lines = 10
+            self.stdout_lines = STDOUT_LINES
             self.stdout_min_height = int(self.font_size_large * 1.5 * self.stdout_lines)
             self.stdout_max_height = int(self.font_size_large * 1.5 * self.stdout_lines)
         else:
@@ -141,7 +157,7 @@ class RSIQViewer(QMainWindow):
             self.button_height = 50
             self.control_panel_height = 60
             # 標準出力: 10行分の高さ（行間1.5倍を考慮）
-            self.stdout_lines = 10
+            self.stdout_lines = STDOUT_LINES
             self.stdout_min_height = int(self.font_size_large * 1.5 * self.stdout_lines)
             self.stdout_max_height = int(self.font_size_large * 1.5 * self.stdout_lines)
 
@@ -151,40 +167,14 @@ class RSIQViewer(QMainWindow):
         """UI初期化"""
         self.setWindowTitle("Rohde & Schwarz IQデータビューワー - [左側でファイル選択 | Ctrl+S: 保存 | Ctrl+Q: 終了]")
 
-        # スクリーンサイズに応じてウィンドウサイズ調整
-        screen = QApplication.primaryScreen()
-        screen_geometry = screen.availableGeometry()
-
-        # 高さを画面いっぱい（95%）に設定し、アスペクト比を維持して横幅を計算
-        # 元のアスペクト比: 1200:900 = 4:3
-        aspect_ratio = 4.0 / 3.0
-
-        # 高さを画面の95%に設定（タスクバー等を考慮）
-        target_height = int(screen_geometry.height() * 0.95)
-
-        # アスペクト比を維持して横幅を計算
-        target_width = int(target_height * aspect_ratio / 1.333)  # 1.333 = 4/3の逆数
-
-        # プラットフォームに応じた調整
-        if sys.platform == 'win32':
-            # Windows: DPIスケーリング対応
-            dpi = screen.logicalDotsPerInch()
-            scale_factor = dpi / 96.0
-            if scale_factor > 1.0:
-                # 高DPI環境では若干縮小
-                target_width = int(target_width / scale_factor * 0.9)
-                target_height = int(target_height / scale_factor * 0.9)
-
-        # 画面幅を超えないように制限
-        max_width = int(screen_geometry.width() * 0.85)
-        if target_width > max_width:
-            target_width = max_width
-            # 幅が制限された場合、高さもアスペクト比に合わせて調整
-            target_height = int(target_width * 1.333)
-
-        # ウィンドウ位置を画面中央に配置
-        x_pos = (screen_geometry.width() - target_width) // 2
-        y_pos = (screen_geometry.height() - target_height) // 2
+        # 初期サイズは固定 1972×1440（論理ピクセル。ユーザー指定）。
+        # Qt 6 は論理ピクセルで扱うので、Windows の DPI スケーリングは Qt が吸収する。
+        # 画面の方が小さい場合だけ、利用可能領域の 95% に収める。
+        screen_geometry = QApplication.primaryScreen().availableGeometry()
+        target_width = min(INITIAL_WINDOW_SIZE[0], int(screen_geometry.width() * 0.95))
+        target_height = min(INITIAL_WINDOW_SIZE[1], int(screen_geometry.height() * 0.95))
+        x_pos = screen_geometry.x() + (screen_geometry.width() - target_width) // 2
+        y_pos = screen_geometry.y() + (screen_geometry.height() - target_height) // 2
 
         self.setGeometry(x_pos, y_pos, target_width, target_height)
 
@@ -192,6 +182,8 @@ class RSIQViewer(QMainWindow):
         central = QWidget()
         self.setCentralWidget(central)
         main_layout = QVBoxLayout(central)
+        main_layout.setContentsMargins(PANE_MARGIN, PANE_MARGIN, PANE_MARGIN, PANE_MARGIN)
+        main_layout.setSpacing(PANE_SPACING)
 
         # === コントロールパネル ===
         self.control_panel = ControlPanel(
@@ -209,6 +201,7 @@ class RSIQViewer(QMainWindow):
 
         # === メインエリア（水平分割：ファイルブラウザ | プロット表示） ===
         main_splitter = QSplitter(Qt.Horizontal)
+        main_splitter.setHandleWidth(SPLITTER_HANDLE)
 
         # === 左側：ファイルブラウザ ===
         self.file_browser = FileBrowserPanel(
@@ -238,7 +231,7 @@ class RSIQViewer(QMainWindow):
         # 時間は update_region_waveform で s/ms/μs に換算済み。pyqtgraph の
         # SI接頭辞を重ねない（重ねると "kms" や "(x0.001)" になる）
         self.region_plot.getAxis('bottom').enableAutoSIPrefix(False)
-        self.region_plot.showGrid(x=True, y=True, alpha=0.3)
+        style_plot(self.region_plot.getPlotItem())
         self.region_plot.setTitle("Region範囲 時間-振幅波形")
         self.region_plot.setMinimumHeight(150)  # 最小高さ150px（マウス拡大で潰れないように）
         self.region_curve = self.region_plot.plot(pen=pg.mkPen('c', width=1))
@@ -266,7 +259,7 @@ class RSIQViewer(QMainWindow):
         self.overview_plot = pg.PlotWidget()
         self.overview_plot.setLabel('left', '振幅')
         self.overview_plot.setLabel('bottom', '時間', units='s')
-        self.overview_plot.showGrid(x=True, y=True, alpha=0.3)
+        style_plot(self.overview_plot.getPlotItem())
         self.overview_plot.setTitle("全データ波形（Min-Maxダウンサンプリング / Region選択）")
         self.overview_curve = self.overview_plot.plot(pen=pg.mkPen('y', width=1))
 
@@ -305,9 +298,29 @@ class RSIQViewer(QMainWindow):
         # コンテキストメニューの設定（元のメニューは維持）
         self.overview_plot.scene().sigMouseClicked.connect(self.on_overview_mouse_clicked)
 
+        # スペクトログラムの選択枠（時間×周波数）の包絡線を音で再生するパネル
+        from iq_analyzer.widgets.envelope_audio import EnvelopeAudioPanel
+
+        self.audio_panel = EnvelopeAudioPanel(
+            selection=self.spectrogram_widget.selection,
+            context=self._audio_context,
+            playhead=self.spectrogram_widget.set_playhead,
+            bulk_read=self._pause_envelope_build,
+        )
+        self.spectrogram_widget.selection_changed.connect(
+            lambda: self.audio_panel.status.setText(self.audio_panel.describe_selection())
+        )
+        spec_container = QWidget()
+        spec_layout = QVBoxLayout(spec_container)
+        spec_layout.setContentsMargins(0, 0, 0, 0)
+        spec_layout.setSpacing(2)
+        spec_layout.addWidget(self.spectrogram_widget, 1)
+        spec_layout.addWidget(self.audio_panel, 0)
+
         # スプリッターで3段に配置
         splitter = QSplitter(Qt.Vertical)
-        splitter.addWidget(self.spectrogram_widget)
+        splitter.setHandleWidth(SPLITTER_HANDLE)
+        splitter.addWidget(spec_container)
         splitter.addWidget(self.region_plot)
         splitter.addWidget(self.overview_plot)
 
@@ -319,13 +332,18 @@ class RSIQViewer(QMainWindow):
         main_splitter.addWidget(plot_container)
 
         # メインスプリッターのサイズ比率設定
-        # ファイルブラウザ:プロット表示 = 1:4（ウィンドウ幅の20%）。
-        # 1:8 ではツリー3階層目のファイル名（例: Sky2023-12_header.wvh）が切れた。
+        # ファイルブラウザ:プロット表示 = 1:3（ウィンドウ幅の約25%、1972 px で約490 px）。
+        # 20 pt での実測: ツリー最長行 397 px、ファイル情報の行は最長 459 px
+        # （レベルオフセットの行 585 px だけは折り返す）。1:4（20%）では情報欄が窮屈だった。
         # setSizes は表示時の実幅に比例配分されるので、比率として与える。
-        main_splitter.setSizes([200, 800])
+        # 表示前の setSizes は仮の幅で配分されるので（1972 px で 18% になった）、
+        # 初回表示時に showEvent で実幅から配分し直す。
+        main_splitter.setSizes([250, 750])
         # ウィンドウを広げた分もこの比率で配分する
         main_splitter.setStretchFactor(0, 1)
-        main_splitter.setStretchFactor(1, 4)
+        main_splitter.setStretchFactor(1, 3)
+        self.main_splitter = main_splitter
+        self._initial_split_done = False
 
         # メインスプリッターをストレッチファクター1で追加（可変高さ）
         main_layout.addWidget(main_splitter, 1)
@@ -334,10 +352,12 @@ class RSIQViewer(QMainWindow):
         bottom_container = QWidget()
         bottom_layout = QHBoxLayout(bottom_container)
         bottom_layout.setContentsMargins(0, 0, 0, 0)
+        bottom_layout.setSpacing(PANE_SPACING)
 
         # 左側: 標準出力表示エリア
         stdout_group = QGroupBox("標準出力")
         stdout_layout = QVBoxLayout()
+        stdout_layout.setContentsMargins(0, 0, 0, 0)
 
         self.stdout_text = QTextEdit()
         self.stdout_text.setReadOnly(True)
@@ -347,17 +367,31 @@ class RSIQViewer(QMainWindow):
         self.stdout_text.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.stdout_text.setStyleSheet(f"""
             QTextEdit {{
-                background-color: #1e1e1e;
-                color: #d4d4d4;
+                background-color: {SURFACE};
+                color: {TEXT};
                 font-family: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
                 font-size: {self.font_size_large}pt;
-                border: 1px solid #3e3e3e;
+                border: 1px solid {LINE};
                 line-height: 1.3;
             }}
         """)
         self.stdout_text.setPlaceholderText("標準出力がここに表示されます...")
         # 行数上限はQt側で管理する（全文を書き直す方式だとエラー行の色が消える）
         self.stdout_text.document().setMaximumBlockCount(1000)
+        # 高さは「行数 × 実際の1行の高さ」で決める。ログは日本語を含み、和文は
+        # 代替フォント（ヒラギノ等）で描かれて行が高くなる（20pt で 25→約34 px）。
+        # 等幅フォントの行送りや 20pt×1.5 の概算では 6 行のつもりが 5 行強しか
+        # 見えなかったので、和文を含む見本の行を実際にレイアウトして測る。
+        self.stdout_text.ensurePolished()
+        probe = QTextDocument()
+        probe.setDefaultFont(self.stdout_text.font())
+        probe.setPlainText("[Region波形更新] サンプル: 2,000,000,000")
+        line = math.ceil(probe.documentLayout().blockBoundingRect(probe.firstBlock()).height())
+        doc_margin = int(self.stdout_text.document().documentMargin())
+        frame = self.stdout_text.frameWidth()
+        stdout_h = line * self.stdout_lines + 2 * (doc_margin + frame)
+        self.stdout_text.setMinimumHeight(stdout_h)
+        self.stdout_text.setMaximumHeight(stdout_h)
 
         stdout_layout.addWidget(self.stdout_text)
         stdout_group.setLayout(stdout_layout)
@@ -401,12 +435,14 @@ class RSIQViewer(QMainWindow):
         # ステータスバー（水平レイアウト）
         status_container = QWidget()
         status_layout = QHBoxLayout()
-        status_layout.setContentsMargins(5, 5, 5, 5)
+        status_layout.setContentsMargins(0, 0, 0, 0)
         status_container.setLayout(status_layout)
 
         # 左側：ステータスメッセージ
         self.status_label = QLabel("左側のファイルブラウザからファイルを選択してください")
         self.status_label.setStyleSheet(f"font-size: {self.font_size_large}pt; padding: 5px;")
+        # 長いメッセージでウィンドウの最小幅が広がらないようにする
+        self.status_label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         status_layout.addWidget(self.status_label, 1)  # ストレッチファクター1で伸縮
 
         # 右側：メモリ使用量表示
@@ -426,6 +462,15 @@ class RSIQViewer(QMainWindow):
         # キーボードショートカットの設定
         self.setup_shortcuts()
 
+
+    def showEvent(self, event):
+        """初回表示時にファイルブラウザ:プロット = 1:3 を実幅で配分する。"""
+        super().showEvent(event)
+        if not self._initial_split_done:
+            self._initial_split_done = True
+            total = sum(self.main_splitter.sizes())
+            if total > 0:
+                self.main_splitter.setSizes([total // 4, total - total // 4])
 
     def setup_shortcuts(self):
         """
@@ -528,7 +573,8 @@ class RSIQViewer(QMainWindow):
             # ========================================
             # 3. メモリマップをクローズ
             # ========================================
-            # エンベロープ構築スレッドはmemmapを直接読むため、ローダーより先に止める
+            # エンベロープ構築スレッドと包絡線の再生はローダーを読むため、ローダーより先に止める
+            self.audio_panel.shutdown()
             self._stop_envelope_worker()
             self.envelope = None
             self._overview_preview = None
@@ -1059,6 +1105,22 @@ class RSIQViewer(QMainWindow):
         finally:
             if worker is not None:
                 worker.resume()
+
+    def _pause_envelope_build(self, active):
+        """包絡線の計算が生データを読む間、エンベロープ構築を止める（同一ドライブの並行読みは極端に遅い）。"""
+        worker = self._envelope_worker
+        if worker is None:
+            return
+        if active:
+            worker.pause()
+        else:
+            worker.resume()
+
+    def _audio_context(self):
+        """包絡線再生パネル用: (loader, サンプルレート, 中心周波数, 総サンプル数)。"""
+        if self.wv_loader is None or self.total_samples == 0:
+            return None
+        return self.wv_loader, self.sample_rate, float(self.center_frequency or 0.0), self.total_samples
 
     def _stop_envelope_worker(self):
         worker = getattr(self, '_envelope_worker', None)
@@ -1822,7 +1884,7 @@ class RSIQViewer(QMainWindow):
         self.on_region_changed()
 
 
-    _STDERR_COLOR = "#ff6b6b"
+    _STDERR_COLOR = ERROR
 
     def append_stdout(self, text):
         """標準出力テキストをパネルに追加する。"""
@@ -1999,7 +2061,9 @@ class RSIQViewer(QMainWindow):
                         self.region_viewbox.sigRangeChanged.disconnect()
 
             # 4. メモリマップを先にクローズ（プロットデータより前に）
-            #    エンベロープ構築スレッドがmemmapを読んでいるので、さらにその前に止める
+            #    エンベロープ構築スレッドと包絡線の再生がmemmapを読んでいるので、さらにその前に止める
+            with contextlib.suppress(Exception):
+                self.audio_panel.shutdown()
             with contextlib.suppress(Exception):
                 self._stop_envelope_worker()
             if hasattr(self, 'wv_loader') and self.wv_loader is not None:

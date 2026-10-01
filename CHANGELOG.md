@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Envelope playback of a spectrogram selection (▶ 包絡線を再生). A
+  rectangular ROI (time × frequency; corner handle at the bottom-right, edge
+  handles) selects the range; the IQ of that span is FFT'd, the band kept
+  with raised-cosine edges, inverse transformed, and its magnitude — the
+  Hilbert envelope, since IQ is already the analytic signal — rendered at
+  48 kHz with a peak or mean detector, optional dB compression and speeds
+  from 4× to 1/1000. Block-wise overlap-discard keeps memory flat; playback
+  via Qt Multimedia with a moving playhead, loop and WAV export.
+- Flat dark theme (`ui.style`): one set of colour tokens for the Qt palette,
+  stylesheet and pyqtgraph; Fusion style; low-contrast separators and axes;
+  shared action buttons coloured by role (run / save / stop).
+- File information shown as a label/value table in the standard UI font.
+
+### Changed
+
+- Window opens at 1972×1440 (clamped to the screen); file browser takes a
+  quarter of the width (applied on first show); 4 px margins, 2 px splitter
+  handles; the log shows six lines sized from the real CJK line height;
+  display settings in two columns.
+- qdarktheme is no longer used (its sheet left 5–7 px gaps around panes);
+  the `[darktheme]` extra is removed.
+- macOS per-class fonts (labels, tables, headers at 11–13 pt) are pinned to
+  the application font after the style and stylesheet are applied.
+- Long status messages no longer raise the minimum window width.
+
 - `scripts/generate_demo_iq.py`: synthetic WVH/WVD demo capture (frequency
   hopper, two CW carriers, pulsed LFM radar with a scan pattern, wideband
   bursts; Fc 5.8 GHz, 100 MS/s) so the viewer can be tried without instrument

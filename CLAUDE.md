@@ -22,7 +22,7 @@ This is a high-performance IQ data viewer and processing tool for Rohde & Schwar
 - **GUI Framework**: PySide6
 - **Plotting Library**: PyQtGraph
 - **Optional Performance**: Cython or Julia (if single-file EXE is achievable)
-- **Theme**: qdarktheme (optional, fallback to default)
+- **Theme**: built-in flat dark theme (`iq_analyzer.ui.style`; qdarktheme is no longer used)
 
 ## Data Formats: Rohde & Schwarz IQ Files
 
@@ -254,7 +254,6 @@ PySide6
 pyqtgraph
 numpy
 scipy
-qdarktheme (optional)
 ```
 
 ## Reference Implementation

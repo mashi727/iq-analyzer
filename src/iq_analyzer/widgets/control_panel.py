@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Signal
-from PySide6.QtWidgets import QHBoxLayout, QPushButton, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QWidget
+
+from iq_analyzer.ui.style import action_button
 
 
 class ControlPanel(QWidget):
-    """The three main action buttons, right-aligned."""
+    """The main action buttons, right-aligned."""
 
     calculate_clicked = Signal()
     save_clicked = Signal()
@@ -22,39 +24,38 @@ class ControlPanel(QWidget):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        self._font_size_large = font_size_large
-        self._button_height = button_height
+        # Size and colours come from ui.style.action_button (shared with the
+        # playback panel); the two size
+        # arguments are kept for API compatibility.
+        del font_size_large, button_height
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
         layout.addStretch()
 
-        self.calc_spec_btn = self._make_button(
+        self.calc_spec_btn = action_button(
             "📊 スペクトログラム計算",
             "選択したRegion範囲のスペクトログラムを手動計算\n自動更新がOFFの場合に使用",
-            background="#4CAF50",
-            hover="#45A049",
+            role="run",
         )
         self.calc_spec_btn.setEnabled(False)
         self.calc_spec_btn.clicked.connect(self.calculate_clicked.emit)
         layout.addWidget(self.calc_spec_btn)
 
-        self.save_btn = self._make_button(
+        self.save_btn = action_button(
             "💾 保存",
             "選択したRegion範囲をWVH/WVD形式で保存",
-            background="#00BCD4",
-            hover="#0097A7",
+            role="save",
         )
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.save_clicked.emit)
         layout.addWidget(self.save_btn)
 
-        self.exit_btn = self._make_button(
+        self.exit_btn = action_button(
             "🚪 終了",
             "アプリケーションを終了 (Ctrl+Q / Cmd+Q)",
-            background="#f44336",
-            hover="#d32f2f",
+            role="stop",
         )
         self.exit_btn.clicked.connect(self.exit_clicked.emit)
         layout.addWidget(self.exit_btn)
@@ -71,27 +72,3 @@ class ControlPanel(QWidget):
 
     def set_save_enabled(self, enabled: bool) -> None:
         self.save_btn.setEnabled(enabled)
-
-    def _make_button(self, label: str, tooltip: str, *, background: str, hover: str) -> QPushButton:
-        btn = QPushButton(label)
-        btn.setToolTip(tooltip)
-        btn.setFixedHeight(self._button_height)
-        btn.setStyleSheet(
-            f"""
-            QPushButton {{
-                background-color: {background};
-                color: white;
-                font-weight: bold;
-                font-size: {self._font_size_large}pt;
-                padding: 5px 15px;
-            }}
-            QPushButton:hover {{
-                background-color: {hover};
-            }}
-            QPushButton:disabled {{
-                background-color: #cccccc;
-                color: #666666;
-            }}
-            """
-        )
-        return btn

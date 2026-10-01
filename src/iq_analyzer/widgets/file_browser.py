@@ -25,6 +25,7 @@ from __future__ import annotations
 import os
 import stat
 import sys
+from html import escape
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -53,6 +54,7 @@ from PySide6.QtWidgets import (
 
 from iq_analyzer.loaders import IQTarLoader, KeysightBinLoader, SMUWVLoader, WVFileLoader
 from iq_analyzer.loaders.wv import resolve_wvh
+from iq_analyzer.ui.style import LINE, SURFACE, TEXT
 
 _PATH_ROLE = Qt.ItemDataRole.UserRole  # item path (str); None for ".." and "この Mac"
 _LOADED_ROLE = Qt.ItemDataRole.UserRole + 1  # folder children already read
@@ -62,6 +64,33 @@ _PLACEHOLDER = "…"  # dummy child so unread folders show an expander
 _HIDDEN_VOLUME_NAMES = {"Recovery", "Preboot", "VM", "Update", "xarts", "iSCPreboot", "Hardware"}
 _NETWORK_FS = {"smbfs", "afpfs", "nfs", "webdav", "cifs", "smb3", "fuse.sshfs"}
 _COMPUTER_LABEL = "この Mac" if sys.platform == "darwin" else "PC"
+
+
+def _header_html(name: str, body: str) -> str:
+    """Two-column table (label | value) from ``"label:   value"`` lines.
+
+    The text used to be aligned with spaces in a monospace font; Japanese
+    labels fall back to a proportional CJK face there, so the columns never
+    lined up. A table aligns in the standard UI font. Blank lines become
+    small gaps between groups.
+    """
+    rows = []
+    for line in body.split("\n"):
+        if not line.strip():
+            rows.append('<tr><td colspan="2" style="font-size:40%">&nbsp;</td></tr>')
+            continue
+        label, sep, value = line.partition(":")
+        if not sep:
+            rows.append(f'<tr><td colspan="2">{escape(line.strip())}</td></tr>')
+            continue
+        rows.append(
+            f'<tr><td style="padding-right:12px; white-space:nowrap">{escape(label.strip())}</td>'
+            f"<td>{escape(value.strip())}</td></tr>"
+        )
+    return (
+        f"<p style='font-weight:bold; margin-bottom:6px'>{escape(name)}</p>"
+        f"<table cellspacing='0' cellpadding='1'>{''.join(rows)}</table>"
+    )
 
 
 def _format_duration(samples: int, clock_hz: float) -> str | None:
@@ -261,11 +290,6 @@ def _is_hidden(entry: os.DirEntry) -> bool:
     return bool(getattr(st, "st_flags", 0) & getattr(stat, "UF_HIDDEN", 0))
 
 
-def _display_width(name: str) -> int:
-    """Rough fixed-width column count: non-ASCII counts as 2, ASCII as 1."""
-    return sum(2 if ord(c) > 127 else 1 for c in name)
-
-
 class FileBrowserPanel(QWidget):
     """Folder tree + header preview for IQ recordings."""
 
@@ -314,6 +338,7 @@ class FileBrowserPanel(QWidget):
         outer.setContentsMargins(0, 0, 0, 0)
         group = QGroupBox("ファイルブラウザ")
         layout = QVBoxLayout(group)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         self.tree = QTreeWidget()
         self.tree.setColumnCount(1)
@@ -332,6 +357,7 @@ class FileBrowserPanel(QWidget):
         # Tree and header preview share the column through a splitter so the
         # user can trade one for the other; the tree gets most of it.
         splitter = QSplitter(Qt.Orientation.Vertical)
+        splitter.setHandleWidth(2)
         splitter.setChildrenCollapsible(False)
         splitter.addWidget(self.tree)
         info = QWidget()
@@ -339,7 +365,7 @@ class FileBrowserPanel(QWidget):
         info_layout.setContentsMargins(0, 0, 0, 0)
 
         header_label = QLabel("ファイル情報:")
-        header_label.setStyleSheet("font-weight: bold; margin-top: 10px;")
+        header_label.setStyleSheet("font-weight: bold; margin-top: 4px;")
         info_layout.addWidget(header_label)
 
         self.header_info_text = QTextEdit()
@@ -348,12 +374,11 @@ class FileBrowserPanel(QWidget):
         self.header_info_text.setStyleSheet(
             f"""
             QTextEdit {{
-                background-color: #f5f5f5;
-                color: #333333;
-                font-family: 'SF Mono', 'Menlo', 'Consolas', 'Courier New', monospace;
+                background-color: {SURFACE};
+                color: {TEXT};
                 font-size: {self._font_size_small}pt;
-                border: 1px solid #cccccc;
-                padding: 8px;
+                border: 1px solid {LINE};
+                padding: 4px;
                 line-height: 1.0;
             }}
             """
@@ -648,8 +673,6 @@ class FileBrowserPanel(QWidget):
     _is_iq_file = staticmethod(is_iq_file)  # kept for callers of the old name
 
     def _show_header(self, file_path: Path) -> None:
-        display_name = f"📄 {file_path.name}"
-        rule = "=" * _display_width(display_name)
         try:
             if file_path.suffix in (".wvh", ".wvd"):
                 wv_loader = WVFileLoader()
@@ -678,4 +701,4 @@ class FileBrowserPanel(QWidget):
             )
             return
 
-        self.header_info_text.setPlainText(f"{display_name}\n{rule}\n\n{body}")
+        self.header_info_text.setHtml(_header_html(file_path.name, body))

@@ -4,154 +4,193 @@
 [![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12%20%7C%203.13-blue)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-GUI viewer for very large IQ recordings from Rohde & Schwarz and Keysight test
-equipment. Explore 100 GB-class captures on commodity hardware (Windows 11,
-Core i3, 8 GB RAM) without ever loading the file into RAM.
+**計測器で記録した電波の生データ（IQ データ）を、100 GB 級の大きさでも普通の PC で開いて、
+見て・拡大して・音で聴くためのデスクトップアプリです。**
+Rohde & Schwarz と Keysight の計測器が出力するファイルに対応しています。
 
 ![IQ Analyzer main window](docs/images/main_window.png)
 
-<sub>合成デモ信号（周波数ホッピング・CW 2 波・パルス LFM レーダー・広帯域バースト、
-Fc = 5.8 GHz, 100 MS/s）を表示した例。上から スペクトログラム / Region 内の時間–振幅波形 /
-全体波形（Region 選択）。データは [`scripts/generate_demo_iq.py`](scripts/generate_demo_iq.py) で再現できます。</sub>
+<sub>合成デモ信号（周波数ホッピング・連続波 2 本・パルス信号・広帯域バースト）を表示した例。
+上から スペクトログラム / 選択範囲の波形 / ファイル全体の波形。
+データは [`scripts/generate_demo_iq.py`](scripts/generate_demo_iq.py) で誰でも再現できます。</sub>
 
-## 主な機能
+---
 
-- **100 GB 級に対応** — 初回だけ振幅エンベロープ（4096 サンプルごとの最大・最小）を
-  バックグラウンドで計算してキャッシュ（100 GB で約 49 MB）。2 回目以降は全体波形も
-  ズーム波形も即時表示。121 GB の WVD（外部ドライブ）を開くまで 1.6 秒
-- **メモリ一定のスペクトログラム** — Region を分割して読みながら STFT し、時間方向に
-  max-pool。Region がどれだけ長くてもメモリ使用量は一定で、1 フレームだけのバーストも消えない
-- **4 フォーマット対応** — 同じ UI から透過的に開ける
-  - Rohde & Schwarz **WVH / WVD** (RAW16LE)。`X_header.wvh` + `X_data.wvd` のように
-    名前が違う組もサイズ一致で自動的に対応付け
-  - Rohde & Schwarz **ARB 波形 `.wv`** (SMU-WV, int16 LE の単一ファイル。
-    暗号化などでIQとして解釈できないデータは統計的に検出して警告)
-  - Rohde & Schwarz **iq.tar** (float32 / float64)
-  - Keysight **N5110A `.bin` + `.bin.txt`** (16-bit LE + YScale 自動適用)
-- **エクスプローラー風のファイルブラウザ** — 起動フォルダ・ホーム・「この Mac」（Windows は
-  「PC」）の下に内蔵/外付け/ネットワークドライブ。ドライブの抜き差しやファイルの追加を自動反映。
-  クリックでヘッダー表示、ダブルクリックで読み込み
-- **3 ペイン同期 UI**
-  - 上段: スペクトログラム (ROI 選択, plasma/viridis/inferno/magma カラーマップ,
-    周波数軸は GHz / MHz を自動選択)
-  - 中段: Region 内の詳細時間–振幅波形
-  - 下段: 全体波形のオーバービュー + 線形 Region セレクタ
-- **適応的 STFT パラメータ** — Region の長さから NFFT / overlap / 窓関数を
-  自動選択。8 GB マシン向けにメモリ予算 (~4 GB) で頭打ち
-- **Min-Max エンベロープ デシメーション** — 全体波形プロットでパルス信号の
-  ピークを保持
-- **ログパネル** — 標準出力に加えて、エラー出力・警告・ログを赤字で表示
-  （コンソールの無い Windows の EXE でもエラーを確認できる）
-- **WVH/WVD 形式での書き出し** — Region 範囲をいつでも切り出せる (iq.tar /
-  Keysight からの変換も対応)
+## これは何をするツールか
 
-## 拡大表示の例
+電波を計測器で記録すると、**IQ データ**と呼ばれる数値の列ができます。1 秒間に数億回、
+電波の振幅と位相を測った値です。サンプリング周波数 250 MHz なら 1 秒で約 1 GB、
+1 分強で 100 GB を超えます。普通の波形ビューアやスクリプトでは、メモリに載らず開けません。
 
-![5 ms 区間のスペクトログラム](docs/images/spectrogram_detail.png)
+IQ Analyzer は、このような巨大なファイルを**メモリに読み込まずに**扱い、次のことができます。
 
-<sub>上のデモ信号の 5 ms 区間。80 µs・18 MHz 掃引のチャープパルス、1 ms 滞留の周波数ホッピング、
-2 本の CW が分解できる。</sub>
+| やりたいこと | このツールでできること |
+|---|---|
+| 全体をざっと見たい | 100 GB のファイルでも、全体の波形を 2 秒以内に表示し、拡大・移動できる |
+| どの時刻にどの周波数が出ているか見たい | 選んだ範囲の**スペクトログラム**（時間 × 周波数の強さの図）を描く |
+| 信号を耳で確かめたい | スペクトログラム上で囲んだ範囲を**音に変えて再生**する |
+| 一部だけ取り出したい | 選んだ範囲を WVH/WVD 形式で切り出して保存する |
 
-## インストール (uv)
+目標とする動作環境は Windows 11・Core i3・メモリ 8 GB です（macOS でも動きます）。
 
-[uv](https://docs.astral.sh/uv/) を入れていれば一発で起動できます:
+## 最低限の用語
+
+| 用語 | 意味 |
+|---|---|
+| IQ データ | 電波を複素数（I = 実部、Q = 虚部）で記録したもの。振幅と位相の両方が分かる |
+| サンプリング周波数 | 1 秒間に何回測ったか。250 MHz なら 1 秒に 2 億 5 千万点 |
+| スペクトログラム | 横軸が時間、縦軸が周波数、色が強さの図。「いつ、どの周波数に、どれだけ」が一目で分かる |
+| 包絡線 | 信号の強さの変化だけを取り出した曲線。パルス（短い電波）なら「オン・オフ」の形になる |
+| PRF | パルスが 1 秒に何回繰り返されるか。2,500 回なら 2.5 kHz |
+
+---
+
+## できること
+
+### 1. 巨大なファイルを開いて全体を見る
+
+- 左のファイルブラウザでファイルをダブルクリックするだけで開けます。外付けドライブも一覧に出ます。
+  1 回クリックすると、ファイルの情報（サンプル数、サンプリング周波数、記録時間など）が表で出ます。
+- **初回だけ**、裏で「4096 点ごとの最大値と最小値」を計算して保存します（100 GB のファイルで約 49 MB）。
+  2 回目からは、ファイル全体の波形もズームした波形も即座に出ます。
+  計算中も操作でき、短いパルスが間引きで消えることもありません。
+- 実測：121 GB のファイル（外付けドライブ）を開いて最初の表示まで 1.6 秒、2 回目以降は 0.3 秒未満。
+
+### 2. スペクトログラムで時間と周波数を同時に見る
+
+- 下段の全体波形で青い範囲（Region）をドラッグして選び、**スペクトログラム計算**を押します。
+- 範囲がどれだけ長くても、少しずつ読んで計算するのでメモリ使用量は一定です。
+  1 回しか出ない短いバーストも、表示の縮小で消えないようにしています。
+
+### 3. 選んだ範囲を音で聴く（▶ 包絡線を再生）
+
+- スペクトログラム上の水色の枠で「時間 × 周波数」の範囲を囲みます。右下と各辺の中点のハンドルで大きさを変えられます。
+- 再生ボタンを押すと、枠の周波数帯だけを取り出して、その**包絡線**を音にします。
+  たとえば PRF 2.5 kHz のパルス列は、2,500 Hz の音として聞こえます。
+- 速度は 4 倍速から 1/1000 まで変えられます。遅くすると音も低くなり、細かい変化を聞き取れます。
+  再生中はスペクトログラム上に再生位置の線が動きます。ループ再生と WAV 保存もできます。
+
+### その他
+
+- 選択範囲を WVH/WVD 形式で切り出して保存（iq.tar や Keysight 形式からの変換を含む）
+- エラーや警告を画面下のログ欄に赤字で表示（コンソールのない Windows 版でも確認できる）
+- 黒基調のフラットな画面。ボタンは役割ごとに色をそろえています（緑＝実行、青緑＝保存、赤＝停止）
+
+---
+
+## 使い方（基本の流れ）
+
+1. 左のファイルブラウザで IQ ファイルをダブルクリックして開く
+2. 下段の全体波形で、青い範囲（Region）をドラッグして見たい所を選ぶ
+3. **📊 スペクトログラム計算** を押す（「Region 変更時に自動更新」を ON にすれば自動）
+4. 気になる信号を水色の枠で囲み、**▶ 包絡線を再生** で聴く
+5. 必要なら **💾 保存** で選択範囲を切り出す
+
+## インストール
+
+[uv](https://docs.astral.sh/uv/) があれば次の 4 行で起動できます。
 
 ```bash
 git clone https://github.com/mashi727/iq-analyzer.git
 cd iq-analyzer
-uv sync          # Python 3.12 + 全依存関係を解決
+uv sync          # Python と依存パッケージをまとめて用意
 uv run iq-analyzer
 ```
 
-(pip / Poetry の場合: `pyproject.toml` を直接 `pip install -e .[build]`)
+pip を使う場合は `pip install -e .` でも入ります。
+依存パッケージは PySide6（画面）、pyqtgraph（グラフ）、numpy・scipy（計算）、psutil（メモリ表示）です。
 
-### 依存パッケージ
-
-- **PySide6** ≥ 6.6 — Qt バインディング
-- **pyqtgraph** ≥ 0.13 — 高速プロット
-- **numpy** ≥ 1.26, **scipy** ≥ 1.11 — 信号処理
-- **psutil** ≥ 5.9 — メモリ使用量表示
-- **pyqtdarktheme** ≥ 2.1 — ダークテーマ (任意)
-
-## 使い方
-
-1. 左ペインのファイルブラウザから IQ ファイルをダブルクリックで開く
-   (`.wvh`, `.wvd`, `.wv`, `.iq.tar`, または `.bin.txt` を伴う `.bin`)。
-   外部ストレージは「この Mac」（Windows では「PC」）の下に並ぶ
-2. 下段の Overview で青い線形 Region をドラッグして関心範囲を選択
-3. **📊 スペクトログラム計算** ボタン (or 「Region 変更時に自動更新」 ON) で
-   2D スペクトログラムを描画
-4. 右側パネルで cmap / NFFT / overlap / 下位カットオフを微調整
-5. **💾 保存** で Region 範囲を WVH/WVD に書き出し
-
-### デモデータで試す
-
-R&S や Keysight の実機データが無くても、合成データで一通り試せます。
+### 計測器のデータが無くても試せます
 
 ```bash
-uv run python scripts/generate_demo_iq.py            # demo_data/ に 400 MB の WVH/WVD を生成
-uv run python scripts/generate_demo_iq.py --seconds 5  # 長くしたい場合（2 GB）
+uv run python scripts/generate_demo_iq.py              # demo_data/ に 400 MB の合成データを作る
+uv run python scripts/generate_demo_iq.py --seconds 5  # もっと長く（2 GB）
 ```
 
 起動後、ファイルブラウザで `demo_data/demo_capture.wvh` をダブルクリックしてください。
 
-### 起動方法のバリエーション
+### 対応ファイル形式
+
+| メーカー | 形式 | 拡張子 |
+|---|---|---|
+| Rohde & Schwarz | IQ 記録（16 bit 整数） | `.wvh` + `.wvd`（名前が違う組もサイズで自動的に対応付け） |
+| Rohde & Schwarz | 信号発生器用の波形 | `.wv`（暗号化などで IQ として読めないデータは検出して警告） |
+| Rohde & Schwarz | IQ-TAR（32/64 bit 浮動小数点） | `.iq.tar` |
+| Keysight | N5110A | `.bin` + `.bin.txt` |
+
+---
+
+## 仕組みのポイント（興味のある人向け）
+
+- **メモリに読み込まない**：ファイルは必要な部分だけを読みます（メモリマップと逐次読み込み）。
+  全体波形の要約（4096 点ごとの最大・最小）はユーザーのキャッシュフォルダに保存し、
+  データの隣（外付けドライブや同期フォルダ）には書きません。
+- **短い信号を消さない**：全体波形は区間ごとの最大・最小で描き、スペクトログラムは時間方向に最大値で
+  縮めるので、1 回だけの短いパルスも表示から消えません。
+- **包絡線の作り方**：IQ データはもともと複素数（解析信号）なので、選んだ帯域だけを FFT で取り出して
+  逆変換し、その絶対値を取れば包絡線（ヒルベルト包絡）になります。長い範囲はブロックに分け、
+  境目の影響を捨てながら（オーバーラップ破棄法）つなぎます。音にするときは、音声 1 サンプルの区間内の
+  最大値を採る「ピーク検波」が既定で、数 µs の短いパルスも欠けずにクリック音になります。
+- **外付けドライブで遅くならない工夫**：同じドライブの離れた位置を 2 か所同時に読むと極端に遅くなるため、
+  裏の要約計算は、表で大量に読む間だけ一時停止します。
+
+## 処理時間とメモリの目安（macOS, Apple Silicon で計測）
+
+| シナリオ | 時間 | ピークメモリ |
+|---|---|---|
+| WVD 250 MB を開く | < 1 秒 | ~450 MB |
+| iq.tar 2 GB を開く | < 2 秒 | ~680 MB |
+| Keysight 850 MB を開く | < 2 秒 | ~600 MB |
+| Region 50% のスペクトログラム | < 10 秒 | ~2.5 GB |
+| WVD 121 GB（外付けドライブ）を開く、初回 | 1.6 秒（全体の要約は裏で約 5 分） | 未計測 |
+| 同、2 回目以降 | < 0.3 秒 | — |
+
+---
+
+## 開発者向け
 
 ```bash
-uv run iq-analyzer           # インストール済みエントリポイント
-python -m iq_analyzer        # モジュール実行
-python rs_iq_viewer.py       # 旧スクリプト (後方互換 shim)
+uv sync                    # 開発用の依存も含めて用意
+uv run pytest -q           # テスト（108 件、数秒）
+uv run ruff check .        # lint（--fix で自動修正）
 ```
 
-## パッケージ構造
+起動方法は `uv run iq-analyzer` のほか、`python -m iq_analyzer`、`python rs_iq_viewer.py`（旧スクリプト）でも可能です。
+詳しくは [CONTRIBUTING.md](CONTRIBUTING.md) を参照してください。
+
+<details>
+<summary>パッケージ構造</summary>
 
 ```
 src/iq_analyzer/
-├── cli.py                 # QApplication 起動 + main()
-├── core/
-│   ├── decimation.py      # Min-Max エンベロープ / プレビュー
-│   ├── envelope.py        # 振幅エンベロープのキャッシュ（100 GB 級向け）
-│   ├── memory.py          # メモリ監視 / 色閾値
-│   ├── spectrogram.py     # STFT（分割計算 + 時間方向 max-pool）
+├── cli.py                 # 起動処理（テーマ適用 + メイン画面）
+├── core/                  # 画面に依存しない計算
+│   ├── envelope.py        # 全体波形の要約（4096 点ごとの最大・最小）とキャッシュ
+│   ├── decimation.py      # 表示用の間引き（ピークを保持）
+│   ├── spectrogram.py     # スペクトログラム（分割計算）
+│   ├── audio.py           # 選択範囲の包絡線の音声化
+│   ├── memory.py          # メモリ監視
 │   └── stdout_redirector.py
-├── loaders/
-│   ├── base.py            # IQLoader Protocol
+├── loaders/               # ファイル形式ごとの読み込み
+│   ├── base.py            # 共通インターフェース
 │   ├── wv.py              # R&S WVH/WVD
-│   ├── smuwv.py           # R&S ARB 波形 .wv (SMU-WV)
+│   ├── smuwv.py           # R&S .wv
 │   ├── iqtar.py           # R&S iq.tar
-│   └── keysight.py        # Keysight N5110A .bin
-├── widgets/
-│   ├── spectrogram.py     # SpectrogramWidget + max_pool_2d
-│   ├── file_browser.py    # FileBrowserPanel（ドライブ一覧つきツリー + プレビュー）
-│   ├── control_panel.py   # トップバー (計算/保存/終了)
-│   └── adjustment_panel.py # 表示設定
+│   └── keysight.py        # Keysight .bin
+├── widgets/               # 画面部品
+│   ├── spectrogram.py     # スペクトログラム（選択枠・再生位置）
+│   ├── file_browser.py    # ファイルブラウザ
+│   ├── control_panel.py   # 上部のボタン
+│   ├── adjustment_panel.py # 表示設定
+│   └── envelope_audio.py  # 包絡線の再生
 └── ui/
-    ├── main_window.py     # RSIQViewer (3 プロット同期)
-    └── envelope_worker.py # エンベロープ構築スレッド
+    ├── main_window.py     # メイン画面
+    ├── style.py           # 黒基調のテーマと共通ボタン
+    └── envelope_worker.py # 全体波形の要約を作るスレッド
 scripts/generate_demo_iq.py  # 合成デモデータの生成
 ```
 
-## 開発
-
-```bash
-uv sync                       # dev 依存関係込みでセットアップ
-uv run pytest -q              # 100 ケース、4 秒程度
-uv run ruff check .           # lint
-uv run ruff check --fix .     # auto-fix
-```
-
-詳細は [CONTRIBUTING.md](CONTRIBUTING.md) を参照。
-
-## パフォーマンス目標 (検証環境: macOS, Apple Silicon)
-
-| シナリオ                                  | 起動時間 | ピーク RAM |
-|-------------------------------------------|---------|-----------|
-| WVD 250 MB (65 M samples)                 | < 1 s   | ~450 MB   |
-| iq.tar 2 GB (250 M samples, float32)      | < 2 s   | ~680 MB   |
-| Keysight 850 MB (223 M samples @ 2.4 GSa/s, Fc=10 GHz) | < 2 s   | ~600 MB   |
-| Region 50% でのスペクトログラム計算       | < 10 s  | ~2.5 GB   |
-| WVD 121 GB（外部ドライブ, 303 億サンプル）初回 | 1.6 s（全体波形の構築は裏で約 5 分） | 未計測 |
-| 同 2 回目以降（エンベロープキャッシュ使用） | < 0.3 s | — |
+</details>
 
 ## License
 

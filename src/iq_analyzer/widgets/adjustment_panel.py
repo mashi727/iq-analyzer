@@ -11,9 +11,8 @@ from PySide6.QtCore import Signal
 from PySide6.QtWidgets import (
     QCheckBox,
     QComboBox,
-    QFrame,
+    QGridLayout,
     QGroupBox,
-    QHBoxLayout,
     QLabel,
     QSpinBox,
     QVBoxLayout,
@@ -40,58 +39,33 @@ class AdjustmentPanel(QWidget):
     # ------------------------------------------------------------------ UI
 
     def _build_ui(self) -> None:
+        # Two columns of (label, control) so the panel is only three rows
+        # tall and the bottom strip (log + this panel) stays ~160 px.
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
 
         group = QGroupBox("表示調整")
-        layout = QVBoxLayout(group)
+        grid = QGridLayout(group)
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(4)
 
-        self.auto_update_checkbox = QCheckBox("Region変更時に自動更新")
-        self.auto_update_checkbox.setChecked(False)
-        self.auto_update_checkbox.setToolTip(
-            "ONにするとRegion範囲変更時にスペクトログラムも自動計算"
-        )
-        layout.addWidget(self.auto_update_checkbox)
-
-        layout.addWidget(_separator())
-
-        cmap_row = QHBoxLayout()
-        cmap_row.addWidget(QLabel("カラーマップ:"))
         self.colormap_combo = QComboBox()
         self.colormap_combo.addItems(list(AVAILABLE_COLORMAPS))
-        cmap_row.addWidget(self.colormap_combo)
-        layout.addLayout(cmap_row)
 
-        nfft_row = QHBoxLayout()
-        nfft_row.addWidget(QLabel("NFFT:"))
         self.nfft_spin = QSpinBox()
         self.nfft_spin.setRange(64, 8192)
         self.nfft_spin.setSingleStep(64)
         self.nfft_spin.setValue(256)
         self.nfft_spin.setToolTip("スペクトログラムのFFTサイズ")
-        nfft_row.addWidget(self.nfft_spin)
-        layout.addLayout(nfft_row)
 
-        overlap_row = QHBoxLayout()
-        overlap_row.addWidget(QLabel("オーバーラップ:"))
         self.overlap_spin = QSpinBox()
         self.overlap_spin.setRange(0, 90)
         self.overlap_spin.setSingleStep(10)
         self.overlap_spin.setValue(50)
         self.overlap_spin.setSuffix("%")
         self.overlap_spin.setToolTip("スペクトログラムのオーバーラップ率")
-        overlap_row.addWidget(self.overlap_spin)
-        layout.addLayout(overlap_row)
 
-        layout.addWidget(_separator())
-
-        cutoff_label = QLabel("下位カットオフ:")
-        cutoff_label.setToolTip(
-            "ノイズフロアをカットして小信号を強調\n大きい値でノイズを除去"
-        )
-        layout.addWidget(cutoff_label)
-
-        cutoff_row = QHBoxLayout()
         self.lower_cutoff_spin = QSpinBox()
         self.lower_cutoff_spin.setRange(0, 50)
         self.lower_cutoff_spin.setSingleStep(1)
@@ -104,10 +78,25 @@ class AdjustmentPanel(QWidget):
             "3-5% = 中程度のノイズ除去\n"
             "10%以上 = 強力なノイズ除去"
         )
-        cutoff_row.addWidget(self.lower_cutoff_spin)
-        layout.addLayout(cutoff_row)
+        cutoff_label = QLabel("下位カット:")
+        cutoff_label.setToolTip("ノイズフロアをカットして小信号を強調\n大きい値でノイズを除去")
 
-        layout.addStretch()
+        self.auto_update_checkbox = QCheckBox("Region変更時に自動更新")
+        self.auto_update_checkbox.setChecked(False)
+        self.auto_update_checkbox.setToolTip("ONにするとRegion範囲変更時にスペクトログラムも自動計算")
+
+        grid.addWidget(QLabel("カラーマップ:"), 0, 0)
+        grid.addWidget(self.colormap_combo, 0, 1)
+        grid.addWidget(QLabel("NFFT:"), 0, 2)
+        grid.addWidget(self.nfft_spin, 0, 3)
+        grid.addWidget(QLabel("オーバーラップ:"), 1, 0)
+        grid.addWidget(self.overlap_spin, 1, 1)
+        grid.addWidget(cutoff_label, 1, 2)
+        grid.addWidget(self.lower_cutoff_spin, 1, 3)
+        grid.addWidget(self.auto_update_checkbox, 2, 0, 1, 4)
+        grid.setColumnStretch(1, 1)
+        grid.setColumnStretch(3, 1)
+        grid.setRowStretch(3, 1)
         outer.addWidget(group)
 
     def _wire_signals(self) -> None:
@@ -146,10 +135,3 @@ class AdjustmentPanel(QWidget):
     @property
     def auto_update(self) -> bool:
         return bool(self.auto_update_checkbox.isChecked())
-
-
-def _separator() -> QFrame:
-    line = QFrame()
-    line.setFrameShape(QFrame.HLine)
-    line.setFrameShadow(QFrame.Sunken)
-    return line
