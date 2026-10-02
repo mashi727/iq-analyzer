@@ -69,3 +69,6 @@ resources/
 
 # Output of scripts/generate_demo_iq.py
 demo_data/
+
+# git bundles (they carry full history; never commit them)
+*.bundle
