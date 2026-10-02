@@ -227,6 +227,9 @@ class SpectrogramWidget(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.graphics_widget = pg.GraphicsLayoutWidget()
+        # No outer margin, so the plot's view box can line up with the
+        # waveform plots below it (see ui.style.time_axis_left_width).
+        self.graphics_widget.ci.setContentsMargins(0, 0, 0, 0)
         self.plot_item = self.graphics_widget.addPlot()
         # Time values are already scaled to s/ms/μs/ns by update_spectrogram, so
         # pyqtgraph must not stack its own SI prefix on top ("kms", "(x0.001)").

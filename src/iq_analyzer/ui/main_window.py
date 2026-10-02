@@ -72,6 +72,7 @@ from iq_analyzer.ui.style import (
     SURFACE,
     TEXT,
     style_plot,
+    time_axis_left_width,
 )
 from iq_analyzer.widgets import (
     AdjustmentPanel,
@@ -238,6 +239,11 @@ class RSIQViewer(QMainWindow):
 
         # スペクトログラムと横軸を連動（X軸同期、Y軸は自動調整）
         self.region_plot.setXLink(self.spectrogram_widget.plot_item)
+        # setXLink は画面上の位置で範囲を合わせるので、左軸の幅をそろえないと
+        # 時間範囲がずれる（スペクトログラムと ROI の右端が表示範囲外に出ていた）。
+        axis_w = time_axis_left_width(self.font_size_large)
+        for plot_item in (self.spectrogram_widget.plot_item, self.region_plot.getPlotItem()):
+            plot_item.getAxis('left').setWidth(axis_w)
         region_viewbox = self.region_plot.getViewBox()
         region_viewbox.enableAutoRange(axis='y', enable=True)
 
@@ -260,6 +266,7 @@ class RSIQViewer(QMainWindow):
         self.overview_plot.setLabel('left', '振幅')
         self.overview_plot.setLabel('bottom', '時間', units='s')
         style_plot(self.overview_plot.getPlotItem())
+        self.overview_plot.getPlotItem().getAxis('left').setWidth(time_axis_left_width(self.font_size_large))
         self.overview_plot.setTitle("全データ波形（Min-Maxダウンサンプリング / Region選択）")
         self.overview_curve = self.overview_plot.plot(pen=pg.mkPen('y', width=1))
 

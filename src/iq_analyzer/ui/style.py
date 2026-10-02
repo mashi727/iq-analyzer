@@ -173,6 +173,19 @@ def apply_theme(app: Any, extra_stylesheet: str = "") -> None:
         app.setFont(base, cls)
 
 
+def time_axis_left_width(font_pt: int) -> int:
+    """Fixed width (px) for the left axis of plots that share a time axis.
+
+    pyqtgraph's setXLink aligns linked views by *screen* position, not by
+    data range: when the left axes differ in width (spectrogram 80 px vs
+    waveform 93 px at 20 pt) the linked x range is offset by the difference
+    (3.0–6.0 s showed as 2.991–5.980 s) and the right end of the spectrogram
+    and its ROI fell outside the view. Equal widths make the ranges identical
+    and line the time ticks up vertically.
+    """
+    return max(60, 5 * int(font_pt))
+
+
 def style_plot(plot_item: Any) -> None:
     """Dim axis lines, readable tick labels, faint grid.
 
