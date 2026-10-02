@@ -222,6 +222,47 @@ class SpectrogramWidget(QWidget):
         self.playhead.setPos(t_s * _TIME_FACTORS.get(self.time_unit, 1.0))
         self.playhead.show()
 
+    def select_all(self) -> None:
+        """Stretch the selection over the whole spectrogram image."""
+        ext = self._image_extent()
+        if ext is None:
+            return
+        x0, x1, y0, y1 = ext
+        self._set_selection_rect(x0, x1, y0, y1)
+
+    def select_view(self) -> None:
+        """Fit the selection to the visible (zoomed) part of the image."""
+        ext = self._image_extent()
+        if ext is None:
+            return
+        (vx0, vx1), (vy0, vy1) = self.plot_item.getViewBox().viewRange()
+        x0, x1, y0, y1 = ext
+        nx0, nx1 = max(x0, vx0), min(x1, vx1)
+        ny0, ny1 = max(y0, vy0), min(y1, vy1)
+        if nx1 > nx0 and ny1 > ny0:
+            self._set_selection_rect(nx0, nx1, ny0, ny1)
+
+    def _set_selection_rect(self, x0: float, x1: float, y0: float, y1: float) -> None:
+        self.selection_roi.setPos([x0, y0], finish=False)
+        self.selection_roi.setSize([x1 - x0, y1 - y0], finish=False)
+        self.selection_roi.show()
+        self.selection_changed.emit()
+
+    def _init_selection_menu(self) -> None:
+        """Two entries in the plot's right-click menu (the ViewBox menu also
+        opens over the ROI, which does not take right clicks)."""
+        menu = self.plot_item.getViewBox().menu
+        menu.addSeparator()
+        self.select_all_action = menu.addAction("選択枠を全体に", self.select_all)
+        self.select_view_action = menu.addAction("選択枠を表示範囲に", self.select_view)
+
+        def refresh() -> None:
+            has_image = self._image_extent() is not None
+            self.select_all_action.setEnabled(has_image)
+            self.select_view_action.setEnabled(has_image)
+
+        menu.aboutToShow.connect(refresh)
+
     def _init_ui(self) -> None:
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -246,6 +287,7 @@ class SpectrogramWidget(QWidget):
         self.set_colormap("plasma")
 
         self._init_selection()
+        self._init_selection_menu()
 
         layout.addWidget(self.graphics_widget)
         self.setLayout(layout)

@@ -138,3 +138,35 @@ def test_spectrogram_selection_tracks_unit_changes(qapp) -> None:
 
     w.clear_axes()
     assert not w.selection_roi.isVisible()
+
+
+def test_selection_menu_selects_all_or_visible_range(qapp) -> None:
+    from PySide6.QtCore import Qt
+    from PySide6.QtTest import QTest
+
+    from iq_analyzer.widgets.spectrogram import SpectrogramWidget
+
+    w = SpectrogramWidget()
+    w.resize(900, 500)
+    w.show()
+    w.update_spectrogram(np.linspace(-5e6, 5e6, 64), np.linspace(0.5, 1.5, 100), np.zeros((64, 100)), center_freq=1e9)
+    qapp.processEvents()
+
+    # Right-clicking on the ROI (which covers the image) must still open the menu.
+    menu = w.plot_item.getViewBox().menu
+    centre = w.graphics_widget.mapFromScene(w.selection_roi.sceneBoundingRect().center())
+    QTest.mouseClick(w.graphics_widget.viewport(), Qt.MouseButton.RightButton, Qt.KeyboardModifier.NoModifier, centre)
+    qapp.processEvents()
+    assert menu.isVisible()
+    assert w.select_all_action.isEnabled() and w.select_view_action.isEnabled()
+    menu.hide()
+
+    w.selection_roi.setPos([0.8, 1e9 - 1e6])
+    w.selection_roi.setSize([0.1, 2e6])
+    w.select_all()
+    assert w.selection() == pytest.approx((0.5, 1.5, 1e9 - 5e6, 1e9 + 5e6))
+
+    w.plot_item.getViewBox().setRange(xRange=(0.9, 1.2), yRange=(1e9 - 2e6, 1e9 + 3e6), padding=0)
+    w.select_view()
+    assert w.selection() == pytest.approx((0.9, 1.2, 1e9 - 2e6, 1e9 + 3e6))
+    w.close()
