@@ -1,5 +1,5 @@
 巨大な IQ 記録を@普通の PC で調べる
-	:comment 問題：100 GB 級の IQ が開けない
+	:comment 課題：100 GB 級の IQ が開けない
 	:comment 方針：要約を作り必要な所だけ読む
 	アプリを起動する@$ uv run iq-analyzer
 	ファイルを開く
