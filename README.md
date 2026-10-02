@@ -14,6 +14,14 @@ Rohde & Schwarz と Keysight の計測器が出力するファイルに対応し
 上から スペクトログラム / 選択範囲の波形 / ファイル全体の波形。
 データは [`scripts/generate_demo_iq.py`](scripts/generate_demo_iq.py) で誰でも再現できます。</sub>
 
+## 考え方
+
+何が問題で、それをどう解いているかを PAD（問題分析図）で示します。各段の詳細は下の各節を参照してください。
+
+<img src="docs/pad/concept.png" alt="考え方の PAD。巨大な IQ 記録を普通の PC で調べるため、全体波形の要約を作って開き、Region を選んでスペクトログラムを描き、枠で囲んだ帯域の包絡線を聴き、必要なら切り出す" width="100%">
+
+<sub>図の元は [`docs/pad/concept.spd`](docs/pad/concept.spd)。[padkit](https://github.com/mashi727/padkit) で検査・描画しています。</sub>
+
 ---
 
 ## これは何をするツールか
