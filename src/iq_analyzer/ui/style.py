@@ -34,6 +34,12 @@ PLOT_TEXT = "#9a9a9a"  # tick labels and titles
 # the default near-white axis at 0.3 was too bright on black.
 GRID_ALPHA = 0.5
 ERROR = "#ff6b6b"
+# Region selector on the overview. A clear green stands apart from the yellow
+# overview trace (pyqtgraph's default dark blue vanished on it) and from the
+# cyan detail waveform, and reads calmly on the black background.
+REGION = (0, 230, 118)
+REGION_FILL_ALPHA = 55
+REGION_HOVER_FILL_ALPHA = 85
 
 # Gaps between panes (px). Kept here so every layout uses the same rhythm.
 PANE_MARGIN = 4
@@ -249,3 +255,23 @@ def action_button(label: str, tooltip: str = "", role: str = "run", parent: Any 
         """
     )
     return btn
+
+
+def make_region_item(values: tuple[float, float] = (0.0, 1.0)):
+    """Overview Region selector in the house style.
+
+    Created through this one function because the viewer re-creates the item on
+    every file load (PlotItem.clear() removes it); a second, unstyled
+    constructor there is how the region fell back to the default dark blue.
+    """
+    import pyqtgraph as pg
+
+    region = pg.LinearRegionItem(
+        values=values,
+        movable=True,
+        brush=pg.mkBrush(*REGION, REGION_FILL_ALPHA),
+        hoverBrush=pg.mkBrush(*REGION, REGION_HOVER_FILL_ALPHA),
+        pen=pg.mkPen(REGION, width=2),
+        hoverPen=pg.mkPen("#ffffff", width=3),
+    )
+    return region

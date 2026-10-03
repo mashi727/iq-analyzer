@@ -71,6 +71,7 @@ from iq_analyzer.ui.style import (
     SPLITTER_HANDLE,
     SURFACE,
     TEXT,
+    make_region_item,
     style_plot,
     time_axis_left_width,
 )
@@ -294,11 +295,7 @@ class RSIQViewer(QMainWindow):
 
         # Region選択
         # 初期値は (0, 1) 秒。(0, 100000) だと空の全体波形の軸が 0〜100 ks になっていた
-        self.region = pg.LinearRegionItem(
-            values=(0, 1),
-            brush=(100, 100, 255, 30),
-            pen=pg.mkPen('b', width=2)
-        )
+        self.region = make_region_item((0, 1))
         # Region変更中はRegion波形のみ更新（軽量）
         self.region.sigRegionChanged.connect(self.on_region_changed)
         # Region変更完了後にスペクトログラムを更新（重量級処理）
@@ -533,7 +530,7 @@ class RSIQViewer(QMainWindow):
                         with contextlib.suppress(Exception):
                             self.overview_plot.removeItem(self.region)
                     # 新しいRegionを作成（初期位置は後で設定）
-                    self.region = pg.LinearRegionItem(values=(0, 1), movable=True)
+                    self.region = make_region_item((0, 1))
                     self.region.sigRegionChanged.connect(self.on_region_changed)
                     self.region.sigRegionChangeFinished.connect(self.on_region_change_finished)
                     self.overview_plot.addItem(self.region)

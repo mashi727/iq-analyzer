@@ -133,3 +133,19 @@ def test_stderr_and_logging_reach_output_panel(qapp) -> None:
 
     assert _sys.stderr is not viewer.stderr_redirector
     assert viewer._log_handler not in logging.getLogger("iq_analyzer").handlers
+
+
+def test_region_keeps_house_style_after_file_cleanup(qapp) -> None:
+    # The overview is cleared and the Region re-created on every file load;
+    # that second construction used to fall back to pyqtgraph's dark blue.
+    from iq_analyzer.ui.main_window import RSIQViewer
+    from iq_analyzer.ui.style import REGION
+
+    viewer = RSIQViewer()
+    try:
+        viewer.cleanup_previous_data()
+        c = viewer.region.brush.color()
+        assert (c.red(), c.green(), c.blue()) == REGION
+        assert viewer.region.lines[0].pen.color().getRgb()[:3] == REGION
+    finally:
+        viewer.close()
