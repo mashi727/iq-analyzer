@@ -101,8 +101,10 @@ class RSIQViewer(QMainWindow):
     3. 最下段: 全体波形（間引きあり）+ Region選択
     """
 
-    def __init__(self):
+    def __init__(self, start_dir: str | Path | None = None):
         super().__init__()
+        # ファイルブラウザの起点（None ならカレントディレクトリ。cli.main がコマンドライン引数から渡す）
+        self._start_dir = start_dir
         self.wv_loader = None  # WVFileLoader, IQTarLoader, or KeysightBinLoader
         self.file_type = None  # 'wv', 'smuwv', 'iqtar', or 'keysight'
         self.total_samples = 0
@@ -206,6 +208,7 @@ class RSIQViewer(QMainWindow):
 
         # === 左側：ファイルブラウザ ===
         self.file_browser = FileBrowserPanel(
+            self._start_dir,
             font_size_large=self.font_size_large,
             font_size_small=self.font_size_small,
         )

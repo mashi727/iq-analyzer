@@ -97,6 +97,17 @@ uv sync          # Python と依存パッケージをまとめて用意
 uv run iq-analyzer
 ```
 
+左のファイルブラウザは、起動したときのカレントディレクトリから始まります。別の場所から始めたいときは、
+ドライブかディレクトリを引数で指定します（EXE でも同じです）。
+
+```bash
+uv run iq-analyzer ~/iq-data       # ディレクトリを指定
+iq-analyzer.exe D:                 # Windows：ドライブだけなら、そのドライブの最上位
+iq-analyzer.exe "D:\計測\2026"      # 空白を含むパスは " で囲む
+```
+
+存在しないパスやファイルを指定すると、理由を表示して終了します（終了コード 2）。
+
 pip を使う場合は `pip install -e .` でも入ります。
 依存パッケージは PySide6（画面）、pyqtgraph（グラフ）、numpy・scipy（計算）、psutil（メモリ表示）です。
 
